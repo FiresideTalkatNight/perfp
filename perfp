@@ -1,0 +1,1836 @@
+#!/usr/bin/env python3
+"""
+perfp -- perf preprocessor for Ascend simulator profiling dumps.
+
+Reads the ``visualize_data.bin`` container produced by MindStudio / msInsight,
+splits it into its logical records, and emits an AI-agent friendly analysis
+bundle:
+
+    out/
+      README.md                 how to use this bundle
+      summary.md                human / LLM readable digest
+      summary.json              machine readable digest
+      schema.sql                SQLite DDL
+      queries.sql               example queries
+      profile.sqlite            queryable database (dictionary encoded)
+      csv/                      exported tables (aggregates + event stream)
+      src/                      embedded source files (kernel + CANN headers)
+      raw/trace.json.gz         the original trace timeline, losslessly kept
+      raw/records/*.json        the small non-trace records, raw
+
+Only the Python standard library is used (sqlite3, json, gzip, csv, ...).
+
+Container format (reverse engineered, validated by walking the whole file):
+
+    record header, 12 bytes, little endian:
+        u32 payload_len | u32 reserved(0) | u8 type | u8 subtype | 2 magic bytes
+    payload_len bytes of payload
+    for type == 1 (embedded source file) a further 4096 bytes of padding
+
+Known record types for this producer:
+    1  embedded source file   payload = "path\0" + NUL padding + file content
+    2  Chrome Trace Event JSON (``traceEvents``)
+    3  Files table   (per source line, 38-core arrays)
+    4  Instructions  (2354 static instructions, 38-core arrays) + schema
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import gzip
+import heapq
+import json
+import os
+import re
+import shutil
+import sqlite3
+import struct
+import sys
+import time
+from collections import Counter, defaultdict
+
+VERSION = "0.1.0"
+SCHEMA_VERSION = 1
+
+REC_HDR = struct.Struct("<IIBB2s")
+TYPE_SOURCE = 1
+TYPE_TRACE = 2
+TYPE_FILES = 3
+TYPE_INSTRUCTIONS = 4
+PAD_TYPE1 = 4096
+EVENT_BATCH = 20000
+
+
+# --------------------------------------------------------------------------
+# errors / small helpers
+# --------------------------------------------------------------------------
+
+class PerfpError(Exception):
+    pass
+
+
+QUIET = False
+
+
+def eprint(*args):
+    if not QUIET:
+        print(*args, file=sys.stderr)
+
+
+def human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024.0 or unit == "GB":
+            return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
+        n /= 1024.0
+
+
+def split_loc(text):
+    """'a/b.h:123' -> ('a/b.h', 123); ('a/b.h', None) when no line number."""
+    if not text:
+        return (None, None)
+    p, sep, ln = text.rpartition(":")
+    if sep and ln.isdigit():
+        return (p, int(ln))
+    return (text, None)
+
+
+def safe_relpath(path):
+    """Make an absolute embedded source path safe to write under src/."""
+    p = os.path.normpath("/" + path.lstrip("/")).lstrip("/")
+    if not p or p.startswith(".."):
+        p = re.sub(r"[^A-Za-z0-9._-]+", "_", path)
+    return p
+
+
+def q1(cur, sql, params=(), default=None):
+    row = cur.execute(sql, params).fetchone()
+    if row is None:
+        return default
+    return row[0]
+
+
+# --------------------------------------------------------------------------
+# container reader
+# --------------------------------------------------------------------------
+
+class Record:
+    __slots__ = ("index", "offset", "length", "type", "subtype", "payload")
+
+    def __init__(self, index, offset, length, typ, subtype, payload):
+        self.index = index
+        self.offset = offset
+        self.length = length
+        self.type = typ
+        self.subtype = subtype
+        self.payload = payload
+
+    def __repr__(self):
+        return (f"Record(#{self.index} off={self.offset} len={self.length} "
+                f"type={self.type} sub={self.subtype})")
+
+
+def iter_records(f, size):
+    """Yield Record objects by walking the container. Rewinds ``f`` as needed."""
+    pos = 0
+    idx = 0
+    while pos + 12 <= size:
+        f.seek(pos)
+        head = f.read(12)
+        if len(head) < 12:
+            raise PerfpError(f"truncated record header at offset {pos}")
+        length, reserved, typ, subtype, magic = REC_HDR.unpack(head)
+        if magic[-1] != 0x5A:
+            raise PerfpError(
+                f"bad record magic at offset {pos}: {head.hex(' ')} "
+                "(not a visualize_data.bin container?)"
+            )
+        payload = pos + 12
+        if payload + length > size:
+            raise PerfpError(
+                f"record #{idx} at {pos} claims {length} bytes, "
+                f"but only {size - payload} remain"
+            )
+        yield Record(idx, pos, length, typ, subtype, payload)
+        pos = payload + length + (PAD_TYPE1 if typ == TYPE_SOURCE else 0)
+        idx += 1
+
+    if pos != size:
+        raise PerfpError(
+            f"container walk ended at {pos}, file size is {size} "
+            f"({size - pos} stray bytes)"
+        )
+
+
+def find_bin(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.isfile(path):
+        return path
+    if not os.path.isdir(path):
+        raise PerfpError(f"no such file or directory: {path}")
+    cands = sorted(glob.glob(os.path.join(path, "**", "visualize_data.bin"),
+                             recursive=True))
+    if not cands:
+        cands = sorted(glob.glob(os.path.join(path, "**", "*.bin"),
+                                 recursive=True))
+    if not cands:
+        raise PerfpError(f"could not find visualize_data.bin under {path}")
+    if len(cands) > 1:
+        eprint(f"[perfp] warning: {len(cands)} candidates, using {cands[0]}")
+    return cands[0]
+
+
+# --------------------------------------------------------------------------
+# dictionaries
+# --------------------------------------------------------------------------
+
+class Interner:
+    __slots__ = ("kind", "ids", "items")
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.ids = {}
+        self.items = []
+
+    def get(self, value):
+        i = self.ids.get(value)
+        if i is None:
+            i = len(self.items)
+            self.ids[value] = i
+            self.items.append(value)
+        return i
+
+
+class Ctx:
+    def __init__(self):
+        self.cores = Interner("cores")
+        self.pipes = Interner("pipes")
+        self.names = Interner("names")
+        self.stacks = Interner("code_stacks")
+        self.details = Interner("details")
+        self.pcs = Interner("pcs")
+        self.locations = Interner("locations")
+
+        self.core_stats = {}      # cid -> [n, n_x, dur_sum, ts_min, ts_max]
+        self.pipe_stats = {}      # pid -> [n, dur_sum]
+        self.name_stats = {}      # nid -> [n, n_x, dur_sum]
+        self.stack_stats = {}     # sid -> [n, dur_sum]
+        self.pc_stats = {}        # pcid -> [n, dur_sum]
+        self.stack_meta = {}      # sid -> (inner_file, inner_line, outer_file, outer_line)
+        self.sort_index = {}      # cid -> int
+
+        self.hist = defaultdict(lambda: [0, 0.0])   # (bucket_idx, pid) -> [n, dur]
+        self.spans = []                            # (core_id, group, name_id, pipe_id, ts, dur)
+        self.open_spans = {}
+        self.top_events = []
+        self.ph_counts = Counter()
+        self.event_count = 0
+        self.ts_min = None
+        self.ts_max = None
+        self.source_local = {}    # original path -> relative file under src/
+        self.warnings = []
+
+
+def bump2(d, key, n=1, dur=0.0):
+    v = d.get(key)
+    if v is None:
+        d[key] = [n, dur]
+    else:
+        v[0] += n
+        v[1] += dur
+
+
+# --------------------------------------------------------------------------
+# trace ingestion
+# --------------------------------------------------------------------------
+
+def _iter_trace_events(s):
+    marker = s.find('"traceEvents"')
+    if marker < 0:
+        raise PerfpError('trace record has no "traceEvents" array')
+    start = s.find("[", marker)
+    if start < 0:
+        raise PerfpError('malformed "traceEvents" array')
+    i = start + 1
+    n = len(s)
+    dec = json.JSONDecoder()
+    while True:
+        while i < n and s[i] in " \t\r\n,":
+            i += 1
+        if i >= n:
+            raise PerfpError("unexpected end of trace JSON")
+        if s[i] == "]":
+            return
+        obj, i = dec.raw_decode(s, i)
+        yield obj
+
+
+def ingest_trace(payload, ctx, db, bucket_us, top_n):
+    s = payload.decode("utf-8", "replace")
+    del payload
+
+    cur = db.cursor()
+    ev_rows = []
+    eid = 0
+    t0 = time.time()
+
+    for obj in _iter_trace_events(s):
+        if not isinstance(obj, dict):
+            continue
+        ctx.event_count += 1
+
+        ph = obj.get("ph")
+        if not isinstance(ph, str):
+            ph = "" if ph is None else str(ph)
+
+        raw_ts = obj.get("ts")
+        ts = raw_ts if isinstance(raw_ts, (int, float)) else None
+        raw_dur = obj.get("dur")
+        dur = raw_dur if isinstance(raw_dur, (int, float)) else None
+
+        pid_raw = obj.get("pid")
+        tid_raw = obj.get("tid")
+        name_raw = obj.get("name")
+        cid = ctx.cores.get("" if pid_raw is None else str(pid_raw))
+        pid = ctx.pipes.get("" if tid_raw is None else str(tid_raw))
+        nid = ctx.names.get("" if name_raw is None else str(name_raw))
+
+        args = obj.get("args")
+        if not isinstance(args, dict):
+            args = {}
+
+        code = args.get("code")
+        sid = None
+        if isinstance(code, str) and code:
+            sid = ctx.stacks.get(code)
+            if sid not in ctx.stack_meta:
+                lines = [x for x in code.split("\n") if x.strip()]
+                inner = split_loc(lines[0]) if lines else (None, None)
+                outer = split_loc(lines[-1]) if lines else (None, None)
+                ctx.stack_meta[sid] = (inner[0], inner[1], outer[0], outer[1])
+            bump2(ctx.stack_stats, sid, 1, dur or 0.0)
+
+        detail = args.get("detail")
+        did = ctx.details.get(detail) if isinstance(detail, str) and detail else None
+
+        pc = args.get("pc_addr")
+        pcid = None
+        if isinstance(pc, str) and pc:
+            pc = pc.lower()
+            pcid = ctx.pcs.get(pc)
+            bump2(ctx.pc_stats, pcid, 1, dur or 0.0)
+
+        if ph == "M" and name_raw == "process_sort_index":
+            si = args.get("sort_index")
+            if isinstance(si, (int, float)):
+                ctx.sort_index[cid] = int(si)
+
+        ctx.ph_counts[ph] += 1
+
+        st = ctx.core_stats.get(cid)
+        if st is None:
+            st = [0, 0, 0.0, None, None]
+            ctx.core_stats[cid] = st
+        st[0] += 1
+        if ph == "X":
+            st[1] += 1
+        if dur is not None:
+            st[2] += dur
+        if ts is not None:
+            if st[3] is None or ts < st[3]:
+                st[3] = ts
+            if st[4] is None or ts > st[4]:
+                st[4] = ts
+            if ctx.ts_min is None or ts < ctx.ts_min:
+                ctx.ts_min = ts
+            if ctx.ts_max is None or ts > ctx.ts_max:
+                ctx.ts_max = ts
+
+        bump2(ctx.pipe_stats, pid, 1, dur or 0.0)
+        nst = ctx.name_stats.get(nid)
+        if nst is None:
+            nst = [0, 0, 0.0]
+            ctx.name_stats[nid] = nst
+        nst[0] += 1
+        if ph == "X":
+            nst[1] += 1
+        nst[2] += dur or 0.0
+
+        if ts is not None:
+            b = int(ts // bucket_us)
+            h = ctx.hist[(b, pid)]
+            h[0] += 1
+            if dur is not None:
+                h[1] += dur
+
+        if ph in ("B", "E"):
+            group = obj.get("id")
+            if group is not None:
+                key = (cid, str(group))
+                if ph == "B":
+                    lst = ctx.open_spans.get(key)
+                    if lst is None:
+                        ctx.open_spans[key] = [(nid, pid, ts)]
+                    else:
+                        lst.append((nid, pid, ts))
+                else:
+                    lst = ctx.open_spans.get(key)
+                    if lst:
+                        b_nid, b_pid, b_ts = lst.pop()
+                        if ts is not None and b_ts is not None:
+                            ctx.spans.append((cid, str(group), b_nid, b_pid,
+                                              b_ts, ts - b_ts))
+
+        if dur is not None and top_n > 0:
+            item = (dur, eid, ts, ph, nid, cid, pid, pcid, sid)
+            if len(ctx.top_events) < top_n:
+                heapq.heappush(ctx.top_events, item)
+            elif item[0] > ctx.top_events[0][0]:
+                heapq.heappushpop(ctx.top_events, item)
+
+        ev_rows.append((eid, ts, dur, ph, cid, pid, nid, sid, did, pcid))
+        eid += 1
+        if len(ev_rows) >= EVENT_BATCH:
+            cur.executemany(
+                "INSERT INTO events(id,ts,dur,ph,core_id,pipe_id,name_id,"
+                "code_id,detail_id,pc_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ev_rows,
+            )
+            ev_rows.clear()
+
+    if ev_rows:
+        cur.executemany(
+            "INSERT INTO events(id,ts,dur,ph,core_id,pipe_id,name_id,"
+            "code_id,detail_id,pc_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ev_rows,
+        )
+    db.commit()
+    eprint(f"[perfp] trace: {ctx.event_count} events in {time.time() - t0:.1f}s")
+
+
+# --------------------------------------------------------------------------
+# record 30: instructions
+# --------------------------------------------------------------------------
+
+def load_json_record(f, rec):
+    f.seek(rec.payload)
+    raw = f.read(rec.length)
+    return json.loads(raw.rstrip(b"\x00").decode("utf-8", "replace"))
+
+
+def ingest_instructions(f, rec, ctx, db):
+    j = load_json_record(f, rec)
+    cores = j.get("Cores") or []
+    core_ids = [ctx.cores.get(str(c)) for c in cores]
+    cur = db.cursor()
+
+    instr_rows = []
+    ic_rows = []
+    for it in j.get("Instructions") or []:
+        if not isinstance(it, dict):
+            continue
+        addr = str(it.get("Address") or "").lower()
+        src = it.get("AscendC Inner Code") or ""
+        lid = ctx.locations.get(src) if src else None
+        source = it.get("Source") or ""
+        mnemonic = source.split(" ", 1)[0].strip() if source else ""
+        pipe = it.get("Pipe") or ""
+
+        instr_rows.append((addr, mnemonic, pipe, src, lid))
+
+        arrs = {
+            "calls": it.get("Instructions Executed") or [],
+            "cycles": it.get("Cycles") or [],
+            "gpr": it.get("GPR Count") or [],
+            "pb": it.get("Process Bytes") or [],
+            "ubr": it.get("UB Read Conflict") or [],
+            "ubw": it.get("UB Write Conflict") or [],
+            "util": it.get("Vector Utilization Percentage") or [],
+        }
+
+        for k, cid in enumerate(core_ids):
+            def val(name, default):
+                a = arrs[name]
+                return a[k] if k < len(a) else default
+
+            ic_rows.append((
+                addr, cid,
+                val("calls", 0),
+                val("cycles", 0),
+                val("gpr", 0),
+                val("pb", -1),
+                val("ubr", -1),
+                val("ubw", -1),
+                val("util", None),
+            ))
+
+    cur.executemany(
+        "INSERT OR REPLACE INTO instructions(addr,mnemonic,pipe,src,location_id)"
+        " VALUES (?,?,?,?,?)", instr_rows)
+    cur.executemany(
+        "INSERT OR REPLACE INTO instruction_core(addr,core_id,calls,cycles,gpr,"
+        "process_bytes,ub_read_conflict,ub_write_conflict,vector_util)"
+        " VALUES (?,?,?,?,?,?,?,?,?)", ic_rows)
+    db.commit()
+    eprint(f"[perfp] instructions: {len(instr_rows)} instructions x "
+           f"{len(core_ids)} cores")
+
+
+# --------------------------------------------------------------------------
+# record 1: embedded sources
+# --------------------------------------------------------------------------
+
+def extract_sources(f, recs, out_dir, ctx):
+    src_dir = os.path.join(out_dir, "src")
+    os.makedirs(src_dir, exist_ok=True)
+    manifest = []
+    used = {}
+
+    for rec in recs:
+        f.seek(rec.payload)
+        raw = f.read(rec.length)
+
+        nul = raw.find(b"\x00")
+        if nul < 0:
+            original = raw.decode("utf-8", "replace").strip()
+            content_b = b""
+        else:
+            original = raw[:nul].decode("utf-8", "replace")
+            i = nul
+            while i < len(raw) and raw[i] == 0:
+                i += 1
+            content_b = raw[i:].rstrip(b"\x00")
+
+        rel = safe_relpath(original)
+        if rel in used and used[rel] != original:
+            base, ext = os.path.splitext(rel)
+            rel = f"{base}__{rec.index}{ext}"
+        used[rel] = original
+
+        dest = os.path.join(src_dir, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as g:
+            g.write(content_b)
+
+        text = content_b.decode("utf-8", "replace")
+        n_lines = text.count("\n") + (1 if text else 0)
+        ctx.source_local[original] = os.path.relpath(dest, out_dir)
+        manifest.append((original, os.path.relpath(dest, out_dir),
+                         len(content_b), n_lines))
+
+    with open(os.path.join(src_dir, "MANIFEST.csv"), "w", newline="",
+              encoding="utf-8") as g:
+        w = csv.writer(g)
+        w.writerow(["original_path", "local_path", "size_bytes", "lines"])
+        w.writerows(manifest)
+
+    eprint(f"[perfp] sources: {len(manifest)} files, "
+           f"{human(sum(m[2] for m in manifest))}")
+
+
+# --------------------------------------------------------------------------
+# record 29: per-file line statistics
+# --------------------------------------------------------------------------
+
+def ingest_files(f, rec, ctx, db):
+    j = load_json_record(f, rec)
+    cur = db.cursor()
+
+    fid = 0
+    for fi in j.get("Files") or []:
+        if not isinstance(fi, dict):
+            continue
+        path = fi.get("Source") or ""
+        lines = fi.get("Lines") or []
+        local = ctx.source_local.get(path)
+
+        # source file size / line count from the extracted copy when available
+        size = None
+        n_lines = len(lines)
+        if local:
+            full = os.path.join(os.path.dirname(db_path_global), local) \
+                if db_path_global else None
+            if full and os.path.isfile(full):
+                size = os.path.getsize(full)
+
+        cur.execute(
+            "INSERT OR REPLACE INTO files(id,path,local_path,size,n_lines)"
+            " VALUES (?,?,?,?,?)", (fid, path, local, size, n_lines))
+
+        rows = []
+        for e in lines:
+            if not isinstance(e, dict):
+                continue
+            cyc = [x for x in (e.get("Cycles") or [])
+                   if isinstance(x, (int, float))]
+            gpr = [x for x in (e.get("GPR Count") or [])
+                   if isinstance(x, (int, float))]
+            inst = [x for x in (e.get("Instructions Executed") or [])
+                    if isinstance(x, (int, float))]
+            pb = [x for x in (e.get("Process Bytes") or [])
+                  if isinstance(x, (int, float))]
+            addr_ranges = json.dumps(e.get("Address Range") or [],
+                                     separators=(",", ":"))
+            rows.append((
+                fid,
+                e.get("Line"),
+                addr_ranges,
+                sum(cyc),
+                max(gpr) if gpr else 0,
+                sum(inst),
+                sum(pb),
+            ))
+        cur.executemany(
+            "INSERT OR REPLACE INTO file_lines(file_id,line,addr_ranges,"
+            "cycles,gpr,instructions_executed,process_bytes)"
+            " VALUES (?,?,?,?,?,?,?)", rows)
+        fid += 1
+
+    db.commit()
+    eprint(f"[perfp] files: {fid} files")
+
+
+# --------------------------------------------------------------------------
+# database schema
+# --------------------------------------------------------------------------
+
+DDL = """
+PRAGMA journal_mode=OFF;
+PRAGMA synchronous=OFF;
+
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE cores(
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    sort_index INTEGER,
+    n_events INTEGER DEFAULT 0,
+    n_x INTEGER DEFAULT 0,
+    dur_sum_us REAL DEFAULT 0,
+    ts_min REAL,
+    ts_max REAL
+);
+
+CREATE TABLE pipes(
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    n_events INTEGER DEFAULT 0,
+    dur_sum_us REAL DEFAULT 0
+);
+
+CREATE TABLE names(
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    n_events INTEGER DEFAULT 0,
+    n_x INTEGER DEFAULT 0,
+    dur_sum_us REAL DEFAULT 0
+);
+
+CREATE TABLE code_stacks(
+    id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    inner_file TEXT,
+    inner_line INTEGER,
+    outer_file TEXT,
+    outer_line INTEGER,
+    n_events INTEGER DEFAULT 0,
+    dur_sum_us REAL DEFAULT 0
+);
+
+CREATE TABLE locations(
+    id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL UNIQUE,
+    file TEXT,
+    line INTEGER
+);
+
+CREATE TABLE details(
+    id INTEGER PRIMARY KEY,
+    detail TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE pcs(
+    id INTEGER PRIMARY KEY,
+    addr TEXT NOT NULL UNIQUE,
+    n_events INTEGER DEFAULT 0,
+    dur_sum_us REAL DEFAULT 0
+);
+
+CREATE TABLE events(
+    id INTEGER PRIMARY KEY,
+    ts REAL,
+    dur REAL,
+    ph TEXT,
+    core_id INTEGER,
+    pipe_id INTEGER,
+    name_id INTEGER,
+    code_id INTEGER,
+    detail_id INTEGER,
+    pc_id INTEGER
+);
+
+CREATE TABLE spans(
+    id INTEGER PRIMARY KEY,
+    core_id INTEGER,
+    group_id TEXT,
+    name_id INTEGER,
+    pipe_id INTEGER,
+    ts REAL,
+    dur REAL
+);
+
+CREATE TABLE instructions(
+    addr TEXT PRIMARY KEY,
+    mnemonic TEXT,
+    pipe TEXT,
+    src TEXT,
+    location_id INTEGER
+);
+
+CREATE TABLE instruction_core(
+    addr TEXT,
+    core_id INTEGER,
+    calls INTEGER,
+    cycles INTEGER,
+    gpr INTEGER,
+    process_bytes INTEGER,
+    ub_read_conflict INTEGER,
+    ub_write_conflict INTEGER,
+    vector_util REAL,
+    PRIMARY KEY(addr, core_id)
+);
+
+CREATE TABLE files(
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    local_path TEXT,
+    size INTEGER,
+    n_lines INTEGER
+);
+
+CREATE TABLE file_lines(
+    file_id INTEGER,
+    line INTEGER,
+    addr_ranges TEXT,
+    cycles INTEGER,
+    gpr INTEGER,
+    instructions_executed INTEGER,
+    process_bytes INTEGER,
+    PRIMARY KEY(file_id, line)
+);
+
+CREATE TABLE timeline_hist(
+    bucket_start_us REAL,
+    pipe_id INTEGER,
+    count INTEGER,
+    dur_sum_us REAL
+);
+
+CREATE INDEX idx_events_core ON events(core_id);
+CREATE INDEX idx_events_name ON events(name_id);
+CREATE INDEX idx_events_code ON events(code_id);
+CREATE INDEX idx_events_ts ON events(ts);
+CREATE INDEX idx_spans_name ON spans(name_id);
+CREATE INDEX idx_ic_addr ON instruction_core(addr);
+CREATE INDEX idx_ic_core ON instruction_core(core_id);
+CREATE INDEX idx_hist_bucket ON timeline_hist(bucket_start_us);
+
+CREATE VIEW v_instruction AS
+SELECT i.addr AS addr,
+       i.mnemonic AS mnemonic,
+       i.pipe AS pipe,
+       i.src AS src,
+       l.file AS file,
+       l.line AS line,
+       COALESCE((SELECT SUM(calls)  FROM instruction_core ic WHERE ic.addr=i.addr),0) AS calls,
+       COALESCE((SELECT SUM(cycles) FROM instruction_core ic WHERE ic.addr=i.addr),0) AS cycles,
+       COALESCE((SELECT COUNT(*)    FROM instruction_core ic WHERE ic.addr=i.addr),0) AS core_count,
+       COALESCE(p.n_events,0)    AS trace_n,
+       COALESCE(p.dur_sum_us,0)  AS trace_dur_us
+FROM instructions i
+LEFT JOIN locations l ON l.id = i.location_id
+LEFT JOIN pcs p       ON p.addr = i.addr;
+
+CREATE VIEW v_code_line AS
+SELECT l.file AS file,
+       l.line AS line,
+       l.text AS loc,
+       SUM(ic.calls)  AS calls,
+       SUM(ic.cycles) AS cycles,
+       COUNT(DISTINCT ic.core_id) AS core_count
+FROM instructions i
+JOIN instruction_core ic ON ic.addr = i.addr
+JOIN locations l         ON l.id = i.location_id
+GROUP BY i.location_id;
+
+CREATE VIEW v_code_line_core AS
+SELECT ic.core_id AS core_id,
+       l.file AS file,
+       l.line AS line,
+       SUM(ic.calls)  AS calls,
+       SUM(ic.cycles) AS cycles
+FROM instructions i
+JOIN instruction_core ic ON ic.addr = i.addr
+JOIN locations l         ON l.id = i.location_id
+GROUP BY ic.core_id, i.location_id;
+
+CREATE VIEW v_exec_location AS
+SELECT inner_file AS file,
+       inner_line AS line,
+       SUM(n_events)   AS n_events,
+       SUM(dur_sum_us) AS dur_sum_us,
+       COUNT(*)        AS stacks
+FROM code_stacks
+WHERE inner_file IS NOT NULL
+GROUP BY inner_file, inner_line;
+
+CREATE VIEW v_kernel_location AS
+SELECT outer_file AS file,
+       outer_line AS line,
+       SUM(n_events)   AS n_events,
+       SUM(dur_sum_us) AS dur_sum_us,
+       COUNT(*)        AS stacks
+FROM code_stacks
+WHERE outer_file IS NOT NULL
+GROUP BY outer_file, outer_line;
+"""
+
+
+# --------------------------------------------------------------------------
+# finalize dictionaries + aggregates
+# --------------------------------------------------------------------------
+
+# set while building, used by ingest_files() for local size lookup
+db_path_global = None
+out_global = None
+
+
+def finalize_db(db, ctx, bucket_us):
+    cur = db.cursor()
+
+    cur.executemany(
+        "INSERT INTO cores(id,name,sort_index,n_events,n_x,dur_sum_us,ts_min,ts_max)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        [(i, name, ctx.sort_index.get(i), *ctx.core_stats.get(i, [0, 0, 0.0, None, None]))
+         for i, name in enumerate(ctx.cores.items)])
+
+    cur.executemany(
+        "INSERT INTO pipes(id,name,n_events,dur_sum_us) VALUES (?,?,?,?)",
+        [(i, name, *ctx.pipe_stats.get(i, [0, 0.0]))
+         for i, name in enumerate(ctx.pipes.items)])
+
+    cur.executemany(
+        "INSERT INTO names(id,name,n_events,n_x,dur_sum_us) VALUES (?,?,?,?,?)",
+        [(i, name, *ctx.name_stats.get(i, [0, 0, 0.0]))
+         for i, name in enumerate(ctx.names.items)])
+
+    stack_rows = []
+    for i, code in enumerate(ctx.stacks.items):
+        inner_file, inner_line, outer_file, outer_line = \
+            ctx.stack_meta.get(i, (None, None, None, None))
+        n, dur = ctx.stack_stats.get(i, [0, 0.0])
+        stack_rows.append((i, code, inner_file, inner_line,
+                           outer_file, outer_line, n, dur))
+    cur.executemany(
+        "INSERT INTO code_stacks(id,code,inner_file,inner_line,outer_file,"
+        "outer_line,n_events,dur_sum_us) VALUES (?,?,?,?,?,?,?,?)",
+        stack_rows)
+
+    loc_rows = []
+    for i, text in enumerate(ctx.locations.items):
+        file, line = split_loc(text)
+        loc_rows.append((i, text, file, line))
+    cur.executemany(
+        "INSERT INTO locations(id,text,file,line) VALUES (?,?,?,?)", loc_rows)
+
+    cur.executemany(
+        "INSERT INTO details(id,detail) VALUES (?,?)",
+        [(i, d) for i, d in enumerate(ctx.details.items)])
+
+    cur.executemany(
+        "INSERT INTO pcs(id,addr,n_events,dur_sum_us) VALUES (?,?,?,?)",
+        [(i, addr, *ctx.pc_stats.get(i, [0, 0.0]))
+         for i, addr in enumerate(ctx.pcs.items)])
+
+    cur.executemany(
+        "INSERT INTO spans(id,core_id,group_id,name_id,pipe_id,ts,dur)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [(i, *s) for i, s in enumerate(ctx.spans)])
+
+    cur.executemany(
+        "INSERT INTO timeline_hist(bucket_start_us,pipe_id,count,dur_sum_us)"
+        " VALUES (?,?,?,?)",
+        [(b * bucket_us, pid, n, dur)
+         for (b, pid), (n, dur) in sorted(ctx.hist.items())])
+
+    db.commit()
+
+
+# --------------------------------------------------------------------------
+# CSV export
+# --------------------------------------------------------------------------
+
+def write_csv(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def export_csvs(db, out_dir, ctx, want_events=True, top_n=30,
+                events_plain=False):
+    cur = db.cursor()
+    d = os.path.join(out_dir, "csv")
+    os.makedirs(d, exist_ok=True)
+
+    write_csv(os.path.join(d, "cores.csv"),
+              ["id", "name", "sort_index", "n_events", "n_x",
+               "dur_sum_us", "ts_min", "ts_max"],
+              cur.execute("SELECT id,name,sort_index,n_events,n_x,dur_sum_us,"
+                          "ts_min,ts_max FROM cores ORDER BY id").fetchall())
+
+    write_csv(os.path.join(d, "pipes.csv"),
+              ["id", "name", "n_events", "dur_sum_us"],
+              cur.execute("SELECT id,name,n_events,dur_sum_us FROM pipes "
+                          "ORDER BY dur_sum_us DESC").fetchall())
+
+    write_csv(os.path.join(d, "names.csv"),
+              ["id", "name", "n_events", "n_x", "dur_sum_us"],
+              cur.execute("SELECT id,name,n_events,n_x,dur_sum_us FROM names "
+                          "ORDER BY dur_sum_us DESC").fetchall())
+
+    write_csv(os.path.join(d, "code_stacks.csv"),
+              ["id", "n_events", "dur_sum_us", "inner_file", "inner_line",
+               "outer_file", "outer_line", "code"],
+              cur.execute("SELECT id,n_events,dur_sum_us,inner_file,inner_line,"
+                          "outer_file,outer_line,code FROM code_stacks "
+                          "ORDER BY dur_sum_us DESC").fetchall())
+
+    write_csv(os.path.join(d, "exec_locations.csv"),
+              ["file", "line", "n_events", "dur_sum_us", "stacks"],
+              cur.execute("SELECT file,line,n_events,dur_sum_us,stacks "
+                          "FROM v_exec_location ORDER BY dur_sum_us DESC").fetchall())
+
+    write_csv(os.path.join(d, "kernel_locations.csv"),
+              ["file", "line", "n_events", "dur_sum_us", "stacks"],
+              cur.execute("SELECT file,line,n_events,dur_sum_us,stacks "
+                          "FROM v_kernel_location ORDER BY dur_sum_us DESC").fetchall())
+
+    write_csv(os.path.join(d, "instructions.csv"),
+              ["addr", "mnemonic", "pipe", "src", "file", "line",
+               "calls", "cycles", "core_count", "trace_n", "trace_dur_us"],
+              cur.execute("SELECT addr,mnemonic,pipe,src,file,line,calls,cycles,"
+                          "core_count,trace_n,trace_dur_us FROM v_instruction "
+                          "ORDER BY trace_dur_us DESC").fetchall())
+
+    write_csv(os.path.join(d, "code_lines.csv"),
+              ["file", "line", "loc", "calls", "cycles", "core_count"],
+              cur.execute("SELECT file,line,loc,calls,cycles,core_count "
+                          "FROM v_code_line ORDER BY cycles DESC").fetchall())
+
+    write_csv(os.path.join(d, "files.csv"),
+              ["id", "path", "local_path", "size", "n_lines"],
+              cur.execute("SELECT id,path,local_path,size,n_lines FROM files "
+                          "ORDER BY id").fetchall())
+
+    write_csv(os.path.join(d, "file_lines.csv"),
+              ["file_id", "line", "addr_ranges", "cycles", "gpr",
+               "instructions_executed", "process_bytes"],
+              cur.execute("SELECT file_id,line,addr_ranges,cycles,gpr,"
+                          "instructions_executed,process_bytes FROM file_lines "
+                          "ORDER BY file_id,line").fetchall())
+
+    write_csv(os.path.join(d, "timeline_hist.csv"),
+              ["bucket_start_us", "pipe", "count", "dur_sum_us"],
+              cur.execute("SELECT h.bucket_start_us, COALESCE(p.name,''), "
+                          "h.count, h.dur_sum_us FROM timeline_hist h "
+                          "LEFT JOIN pipes p ON p.id=h.pipe_id "
+                          "ORDER BY h.bucket_start_us, h.pipe_id").fetchall())
+
+    write_csv(os.path.join(d, "spans.csv"),
+              ["id", "core", "group_id", "name", "pipe", "ts", "dur"],
+              cur.execute("SELECT s.id, COALESCE(c.name,''), s.group_id, "
+                          "COALESCE(n.name,''), COALESCE(p.name,''), "
+                          "s.ts, s.dur FROM spans s "
+                          "LEFT JOIN cores c ON c.id=s.core_id "
+                          "LEFT JOIN names n ON n.id=s.name_id "
+                          "LEFT JOIN pipes p ON p.id=s.pipe_id "
+                          "ORDER BY s.dur DESC").fetchall())
+
+    # instruction_core is large: stream it
+    with open(os.path.join(d, "instruction_core.csv"), "w", newline="",
+              encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["addr", "core", "calls", "cycles", "gpr",
+                    "process_bytes", "ub_read_conflict", "ub_write_conflict",
+                    "vector_util"])
+        for row in cur.execute(
+                "SELECT ic.addr, COALESCE(c.name,''), ic.calls, ic.cycles, "
+                "ic.gpr, ic.process_bytes, ic.ub_read_conflict, "
+                "ic.ub_write_conflict, ic.vector_util "
+                "FROM instruction_core ic "
+                "LEFT JOIN cores c ON c.id=ic.core_id "
+                "ORDER BY ic.addr, ic.core_id"):
+            w.writerow(row)
+
+    # top events
+    rows = []
+    for dur, eid, ts, ph, nid, cid, pid, pcid, sid in sorted(
+            ctx.top_events, reverse=True):
+        rows.append((eid, ts, dur, ph,
+                     ctx.cores.items[cid],
+                     ctx.pipes.items[pid],
+                     ctx.names.items[nid],
+                     ctx.pcs.items[pcid] if pcid is not None else "",
+                     ctx.stacks.items[sid][:200] if sid is not None else ""))
+    write_csv(os.path.join(d, "top_events.csv"),
+              ["event_id", "ts", "dur", "ph", "core", "pipe", "name",
+               "pc", "code"], rows)
+
+    # full event stream, dictionary encoded
+    if want_events:
+        core_map = dict(cur.execute("SELECT id,name FROM cores"))
+        pipe_map = dict(cur.execute("SELECT id,name FROM pipes"))
+        name_map = dict(cur.execute("SELECT id,name FROM names"))
+        pc_map = dict(cur.execute("SELECT id,addr FROM pcs"))
+        name = "events.csv" if events_plain else "events.csv.gz"
+        dest = os.path.join(d, name)
+        opener = (open(dest, "w", newline="", encoding="utf-8") if events_plain
+                  else gzip.open(dest, "wt", newline="", encoding="utf-8",
+                                 compresslevel=6))
+        with opener as f:
+            w = csv.writer(f)
+            w.writerow(["id", "ts", "dur", "ph", "core", "pipe", "name",
+                        "code_id", "pc", "detail_id"])
+            for row in cur.execute(
+                    "SELECT id,ts,dur,ph,core_id,pipe_id,name_id,code_id,"
+                    "pc_id,detail_id FROM events ORDER BY id"):
+                eid, ts, dur, ph, cid, pid, nid, sid, pcid, did = row
+                w.writerow([eid, ts, dur, ph,
+                            core_map.get(cid, ""),
+                            pipe_map.get(pid, ""),
+                            name_map.get(nid, ""),
+                            "" if sid is None else sid,
+                            pc_map.get(pcid, ""),
+                            "" if did is None else did])
+        eprint(f"[perfp] events csv: {human(os.path.getsize(dest))}")
+
+
+# --------------------------------------------------------------------------
+# summary
+# --------------------------------------------------------------------------
+
+def sparkline(values):
+    if not values:
+        return ""
+    blocks = "▁▂▃▄▅▆▇█"
+    mx = max(values) or 1
+    return "".join(blocks[min(7, int(v * 7.999 / mx))] for v in values)
+
+
+def fmt_num(v, digits=2):
+    if v is None:
+        return "-"
+    if isinstance(v, int):
+        return f"{v:,}"
+    return f"{v:,.{digits}f}"
+
+
+def build_summary(db, out_dir, ctx, meta):
+    cur = db.cursor()
+    top_n = meta.get("top_n", 30)
+
+    def rows(sql, params=()):
+        return cur.execute(sql, params).fetchall()
+
+    pipes = rows("SELECT name,n_events,dur_sum_us FROM pipes "
+                 "ORDER BY dur_sum_us DESC")
+    total_pipe_dur = sum(r[2] or 0 for r in pipes) or 1.0
+    cores = rows("SELECT name,n_events,n_x,dur_sum_us,ts_min,ts_max FROM cores "
+                 "ORDER BY dur_sum_us DESC")
+    core_durs = [r[3] or 0 for r in cores]
+    top_mnemonics = rows(
+        "SELECT mnemonic,SUM(calls),SUM(cycles),SUM(trace_n),SUM(trace_dur_us) "
+        "FROM v_instruction GROUP BY mnemonic "
+        "ORDER BY SUM(trace_dur_us) DESC LIMIT ?", (top_n,))
+    top_exec = rows("SELECT file,line,n_events,dur_sum_us FROM v_exec_location "
+                    "ORDER BY dur_sum_us DESC LIMIT ?", (top_n,))
+    top_kernel = rows("SELECT file,line,n_events,dur_sum_us FROM v_kernel_location "
+                      "ORDER BY dur_sum_us DESC LIMIT ?", (top_n,))
+    top_instr = rows(
+        "SELECT addr,mnemonic,pipe,src,calls,cycles,trace_n,trace_dur_us "
+        "FROM v_instruction ORDER BY trace_dur_us DESC LIMIT ?", (top_n,))
+    top_lines = rows(
+        "SELECT file,line,loc,calls,cycles FROM v_code_line "
+        "ORDER BY cycles DESC LIMIT ?", (top_n,))
+    hist = rows("SELECT bucket_start_us,SUM(count),SUM(dur_sum_us) "
+                "FROM timeline_hist GROUP BY bucket_start_us "
+                "ORDER BY bucket_start_us")
+    busy = rows("SELECT bucket_start_us,SUM(count),SUM(dur_sum_us) "
+                "FROM timeline_hist GROUP BY bucket_start_us "
+                "ORDER BY SUM(count) DESC LIMIT 10")
+    span_stats = rows(
+        "SELECT n.name,COUNT(*),SUM(s.dur),MAX(s.dur) "
+        "FROM spans s JOIN names n ON n.id=s.name_id "
+        "GROUP BY s.name_id ORDER BY SUM(s.dur) DESC LIMIT 20")
+    top_spans = rows(
+        "SELECT n.name,c.name,s.ts,s.dur,s.group_id "
+        "FROM spans s JOIN names n ON n.id=s.name_id "
+        "JOIN cores c ON c.id=s.core_id ORDER BY s.dur DESC LIMIT 20")
+    ph_counts = ctx.ph_counts
+    n_cores = len(cores)
+    n_events = ctx.event_count
+    ts_min = ctx.ts_min
+    ts_max = ctx.ts_max
+    wall = (ts_max - ts_min) if (ts_min is not None and ts_max is not None) else None
+
+    total_calls = q1(cur, "SELECT SUM(calls) FROM instruction_core") or 0
+    total_cycles = q1(cur, "SELECT SUM(cycles) FROM instruction_core") or 0
+    per_core_cycles = q1(cur, "SELECT MAX(c) FROM (SELECT SUM(cycles) c "
+                              "FROM instruction_core GROUP BY core_id)") or 0
+    x_events = sum(v for k, v in ph_counts.items() if k == "X")
+    span_count = len(ctx.spans)
+    accounted = x_events + span_count
+
+    warnings = list(ctx.warnings)
+    if wall and per_core_cycles and per_core_cycles / wall > 5000:
+        warnings.append(
+            f"`cycles` looks like simulator-internal accounting, not core "
+            f"clock cycles: max per-core cycles={per_core_cycles:,} over "
+            f"{wall:.1f}us implies {per_core_cycles / wall:,.0f} cycles/us. "
+            f"Do not convert it to time; use events.dur for latency.")
+    if wall and core_durs and (sum(core_durs) / max(n_cores, 1)) > wall * 1.2:
+        warnings.append(
+            "Accumulated per-core dur exceeds wall time: instruction "
+            "latencies overlap across pipes, so SUM(dur) is not elapsed time.")
+    if total_calls and accounted != total_calls:
+        warnings.append(
+            f"accounted executions (X events {x_events:,} + B/E spans "
+            f"{span_count:,} = {accounted:,}) != summed instruction "
+            f"executions ({int(total_calls):,}); a few events are unmatched.")
+    if n_cores and min(core_durs) > 0:
+        spread = max(core_durs) / min(core_durs)
+        if spread > 1.05:
+            warnings.append(f"core imbalance detected: max/min per-core dur "
+                            f"= {spread:.3f}")
+
+    summary = {
+        "perfp_version": VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "input": meta.get("input"),
+        "bin_size": meta.get("bin_size"),
+        "records": meta.get("records"),
+        "case": meta.get("case"),
+        "trace": {
+            "events": n_events,
+            "ph": dict(ph_counts),
+            "cores": n_cores,
+            "ts_min": ts_min,
+            "ts_max": ts_max,
+            "wall_us": wall,
+            "code_stacks": len(ctx.stacks.items),
+            "locations": len(ctx.locations.items),
+            "details": len(ctx.details.items),
+            "pcs": len(ctx.pcs.items),
+            "x_events": x_events,
+            "sync_spans": span_count,
+            "accounted_executions": accounted,
+        },
+        "pipes": [
+            {"name": r[0], "n_events": r[1], "dur_sum_us": r[2],
+             "share": (r[2] or 0) / total_pipe_dur}
+            for r in pipes
+        ],
+        "cores": {
+            "count": n_cores,
+            "dur_sum_us": {
+                "min": min(core_durs) if core_durs else None,
+                "max": max(core_durs) if core_durs else None,
+                "mean": (sum(core_durs) / n_cores) if n_cores else None,
+            },
+            "table": [
+                {"name": r[0], "n_events": r[1], "n_x": r[2],
+                 "dur_sum_us": r[3]} for r in cores
+            ],
+        },
+        "top_mnemonics": [
+            {"mnemonic": r[0], "calls": r[1], "cycles": r[2],
+             "trace_n": r[3], "trace_dur_us": r[4]} for r in top_mnemonics
+        ],
+        "top_exec_locations": [
+            {"file": r[0], "line": r[1], "n_events": r[2],
+             "dur_sum_us": r[3]} for r in top_exec
+        ],
+        "top_kernel_locations": [
+            {"file": r[0], "line": r[1], "n_events": r[2],
+             "dur_sum_us": r[3]} for r in top_kernel
+        ],
+        "top_instructions": [
+            {"addr": r[0], "mnemonic": r[1], "pipe": r[2], "src": r[3],
+             "calls": r[4], "cycles": r[5], "trace_n": r[6],
+             "trace_dur_us": r[7]} for r in top_instr
+        ],
+        "top_code_lines": [
+            {"file": r[0], "line": r[1], "loc": r[2], "calls": r[3],
+             "cycles": r[4]} for r in top_lines
+        ],
+        "total_instruction_executions": int(total_calls),
+        "total_cycles": int(total_cycles),
+        "sync_spans": {
+            "count": sum(r[1] for r in span_stats),
+            "by_name": [
+                {"name": r[0], "count": r[1], "dur_sum": r[2],
+                 "dur_max": r[3]} for r in span_stats
+            ],
+        },
+        "warnings": warnings,
+    }
+
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    # ---------------- markdown ----------------
+    L = []
+    add = L.append
+    title = (meta.get("case") or {}).get("id") or os.path.basename(
+        meta.get("input") or "trace")
+    add(f"# perfp summary — {title}\n")
+    add(f"Generated by perfp {VERSION} at {meta.get('built_at')}.\n")
+
+    add("## Headline\n")
+    if wall is not None:
+        add(f"- **{n_cores} cores**, {n_events:,} events, wall **{wall:.2f} us** "
+            f"({ts_min:.3f} .. {ts_max:.3f} us).")
+    if pipes:
+        pn, pn_events, pd = pipes[0]
+        add(f"- dominant pipe: **{pn or '(none)'}** -- "
+            f"{100 * (pd or 0) / total_pipe_dur:.1f}% of accumulated "
+            f"instruction latency.")
+    if top_mnemonics:
+        mn, mc, _mcy, _mtr, md = top_mnemonics[0]
+        add(f"- top mnemonic: **{mn or '(none)'}** -- {fmt_num(md)} us "
+            f"accumulated, {fmt_num(mc, 0)} calls.")
+    if top_kernel:
+        kf, kl, _kn, kd = top_kernel[0]
+        add(f"- top kernel site: `{kf}:{kl}` -- {fmt_num(kd)} us accumulated.")
+    add("")
+    add("_All `dur` figures are accumulated instruction latency; pipes overlap, "
+        "so they are relative hotspots, not wall time._")
+    add("")
+
+    add("## Input\n")
+    add(f"- bin: `{meta.get('input')}` ({human(meta.get('bin_size') or 0)})")
+    add(f"- records: {meta.get('records')}")
+    if meta.get("case"):
+        c = meta["case"]
+        add("- case config: " + ", ".join(f"`{k}={v}`" for k, v in c.items()
+                                          if k != "id"))
+    add("")
+
+    add("## Trace shape\n")
+    add(f"- events: **{n_events:,}**")
+    add("- by phase: " + ", ".join(f"`{k or '?'}` {v:,}"
+                                  for k, v in ph_counts.most_common()))
+    add(f"- cores: **{n_cores}**, distinct pipes: {len(pipes)}")
+    if wall is not None:
+        add(f"- time range: {ts_min:.4f} .. {ts_max:.4f} us "
+            f"(wall {wall:.2f} us)")
+    add(f"- distinct instruction PCs: {len(ctx.pcs.items):,}")
+    add(f"- distinct source stacks: {len(ctx.stacks.items):,}, "
+        f"instruction source locations: {len(ctx.locations.items):,}")
+    add(f"- instruction executions (summed over cores): "
+        f"**{int(total_calls):,}**")
+    add(f"- accounted as X events {x_events:,} + B/E sync spans {span_count:,} "
+        f"= {accounted:,}")
+    add("")
+
+    add("## Pipes (accumulated instruction latency)\n")
+    add("| pipe | events | dur_sum_us | share |")
+    add("|---|---:|---:|---:|")
+    for name, n, dur in pipes:
+        add(f"| {name or '(none)'} | {n:,} | {fmt_num(dur)} | "
+            f"{100 * (dur or 0) / total_pipe_dur:.1f}% |")
+    add("")
+
+    add("## Cores\n")
+    add("| core | events | X events | dur_sum_us |")
+    add("|---|---:|---:|---:|")
+    for name, n, nx, dur, _a, _b in cores[:top_n]:
+        add(f"| {name} | {n:,} | {nx:,} | {fmt_num(dur)} |")
+    if len(cores) > top_n:
+        add(f"| ... ({len(cores) - top_n} more) | | | |")
+    add("")
+
+    add("## Top mnemonics (by accumulated trace latency)\n")
+    add("| mnemonic | calls | cycles | trace_n | trace_dur_us |")
+    add("|---|---:|---:|---:|---:|")
+    for m, calls, cyc, tn, td in top_mnemonics:
+        add(f"| {m or '(none)'} | {fmt_num(calls, 0)} | {fmt_num(cyc, 0)} | "
+            f"{fmt_num(tn, 0)} | {fmt_num(td)} |")
+    add("")
+
+    add("## Top executed source locations (innermost frame)\n")
+    add("| file | line | events | dur_sum_us |")
+    add("|---|---:|---:|---:|")
+    for f, line, n, dur in top_exec:
+        add(f"| {f} | {line if line is not None else '-'} | {n:,} | "
+            f"{fmt_num(dur)} |")
+    add("")
+
+    add("## Top kernel call sites (outermost frame)\n")
+    add("| file | line | events | dur_sum_us |")
+    add("|---|---:|---:|---:|")
+    for f, line, n, dur in top_kernel:
+        add(f"| {f} | {line if line is not None else '-'} | {n:,} | "
+            f"{fmt_num(dur)} |")
+    add("")
+
+    add("## Top instructions\n")
+    add("| addr | mnemonic | pipe | src | calls | cycles | trace_dur_us |")
+    add("|---|---|---|---|---:|---:|---:|")
+    for addr, mn, pipe, src, calls, cyc, tn, td in top_instr:
+        add(f"| {addr} | {mn} | {pipe} | {src} | {fmt_num(calls, 0)} | "
+            f"{fmt_num(cyc, 0)} | {fmt_num(td)} |")
+    add("")
+
+    add("## Top source lines (instruction accounting)\n")
+    add("| file | line | calls | cycles |")
+    add("|---|---:|---:|---:|")
+    for f, line, loc, calls, cyc in top_lines:
+        add(f"| {f} | {line if line is not None else '-'} | "
+            f"{fmt_num(calls, 0)} | {fmt_num(cyc, 0)} |")
+    add("")
+
+    add("## Timeline histogram\n")
+    if hist:
+        add(f"Bucket size {meta.get('bucket_us')} us. Events per bucket:\n")
+        add("```")
+        add(sparkline([r[1] for r in hist]))
+        add("```\n")
+        add("| bucket_start_us | events | dur_sum_us |")
+        add("|---:|---:|---:|")
+        for b, n, dur in busy:
+            add(f"| {b:.3f} | {n:,} | {fmt_num(dur)} |")
+    add("")
+
+    add("## Synchronization spans (B/E pairs)\n")
+    if span_stats:
+        add("| name | count | dur_sum_us | dur_max_us |")
+        add("|---|---:|---:|---:|")
+        for name, n, ds, dm in span_stats:
+            add(f"| {name} | {n:,} | {fmt_num(ds)} | {fmt_num(dm)} |")
+        add("")
+        add("Longest spans:\n")
+        add("| name | core | ts | dur_us | group |")
+        add("|---|---|---:|---:|---|")
+        for name, core, ts, dur, group in top_spans:
+            add(f"| {name} | {core} | {fmt_num(ts, 4)} | {fmt_num(dur, 4)} | "
+                f"{group} |")
+    else:
+        add("_no B/E spans found_")
+    add("")
+
+    if warnings:
+        add("## Warnings / caveats\n")
+        for w in warnings:
+            add(f"- {w}")
+        add("")
+
+    add("## How to query\n")
+    add("```bash")
+    add(f"sqlite3 {out_dir}/profile.sqlite")
+    add("```")
+    add("")
+    add("Useful views: `v_instruction`, `v_code_line`, `v_code_line_core`, "
+        "`v_exec_location`, `v_kernel_location`.")
+    add("See `queries.sql` for ready-made queries and `README.md` for the "
+        "schema.")
+    add("")
+
+    with open(os.path.join(out_dir, "summary.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+
+    eprint(f"[perfp] summary: {os.path.getsize(os.path.join(out_dir, 'summary.md'))} bytes")
+
+
+# --------------------------------------------------------------------------
+# case config / sim log
+# --------------------------------------------------------------------------
+
+def find_case_files(bin_path):
+    d = os.path.dirname(os.path.abspath(bin_path))
+    case_json = None
+    sim_log = None
+    for _ in range(5):
+        if sim_log is None:
+            logs = sorted(glob.glob(os.path.join(d, "*.sim.log")) +
+                          glob.glob(os.path.join(d, "*sim.log")))
+            if logs:
+                sim_log = logs[0]
+        if case_json is None:
+            for jp in sorted(glob.glob(os.path.join(d, "*.json"))):
+                try:
+                    with open(jp, encoding="utf-8") as f:
+                        o = json.load(f)
+                except Exception:
+                    continue
+                if isinstance(o, dict) and "id" in o and (
+                        "B" in o or "dtype" in o or "M" in o):
+                    case_json = o
+                    break
+        if case_json is not None and sim_log is not None:
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return case_json, sim_log
+
+
+def parse_simlog(path):
+    rows = []
+    in_table = False
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("core_name"):
+                in_table = True
+                continue
+            if not in_table:
+                continue
+            parts = s.split()
+            if len(parts) >= 3 and parts[0].startswith("core"):
+                try:
+                    rows.append((parts[0], float(parts[1]), float(parts[2])))
+                except ValueError:
+                    pass
+            elif rows:
+                in_table = False
+    return rows
+
+
+# --------------------------------------------------------------------------
+# build
+# --------------------------------------------------------------------------
+
+def prepare_out(path, force):
+    path = os.path.abspath(path)
+    if os.path.exists(path) and os.listdir(path):
+        if not force:
+            raise PerfpError(
+                f"output directory {path} is not empty (use --force to replace)")
+        if path in ("/", os.path.expanduser("~")):
+            raise PerfpError("refusing to remove a protected directory")
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def write_raw_trace(f, rec, out_dir, plain=False):
+    """Write the trace payload, stripping the container's trailing NUL padding.
+
+    The payload is a complete JSON document followed by a few NUL bytes.  We
+    keep the JSON text byte-for-byte so the original timeline is lossless, but
+    drop the padding so the result is directly consumable by jq/json.load.
+    """
+    raw_dir = os.path.join(out_dir, "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+
+    # discover trailing NUL padding from the last block only
+    probe = min(64, rec.length)
+    f.seek(rec.payload + rec.length - probe)
+    tail = f.read(probe)
+    stripped = len(tail) - len(tail.rstrip(b"\x00"))
+    body_len = rec.length - stripped
+
+    dest = os.path.join(raw_dir, "trace.json" if plain else "trace.json.gz")
+    opener = open if plain else lambda p, mode: gzip.open(
+        p, mode, compresslevel=6)
+    with opener(dest, "wb") as g:
+        f.seek(rec.payload)
+        left = body_len
+        while left:
+            chunk = f.read(min(8 << 20, left))
+            if not chunk:
+                break
+            g.write(chunk)
+            left -= len(chunk)
+    eprint(f"[perfp] raw timeline: {human(os.path.getsize(dest))}")
+
+
+def write_raw_records(f, recs, out_dir):
+    raw_dir = os.path.join(out_dir, "raw", "records")
+    os.makedirs(raw_dir, exist_ok=True)
+    for rec in recs:
+        if rec.type in (TYPE_FILES, TYPE_INSTRUCTIONS):
+            f.seek(rec.payload)
+            raw = f.read(rec.length).rstrip(b"\x00")
+            try:
+                obj = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            name = "files.json" if rec.type == TYPE_FILES else "instructions.json"
+            with open(os.path.join(raw_dir, name), "w", encoding="utf-8") as g:
+                json.dump(obj, g, ensure_ascii=False, separators=(",", ":"))
+
+
+def write_meta_files(out_dir, meta):
+    with open(os.path.join(out_dir, "schema.sql"), "w", encoding="utf-8") as f:
+        f.write(DDL.strip() + "\n")
+
+    queries = """\
+-- perfp example queries
+-- open with: sqlite3 profile.sqlite
+
+-- 1. Pipe balance (accumulated instruction latency; overlapping pipes)
+SELECT name, n_events, ROUND(dur_sum_us,2) AS dur_us
+FROM pipes ORDER BY dur_sum_us DESC;
+
+-- 2. Per-core balance
+SELECT name, n_events, n_x, ROUND(dur_sum_us,2) AS dur_us
+FROM cores ORDER BY dur_sum_us DESC;
+
+-- 3. Top instruction mnemonics by accumulated trace latency
+SELECT mnemonic, SUM(calls) AS calls, SUM(cycles) AS cycles,
+       SUM(trace_dur_us) AS trace_dur_us
+FROM v_instruction GROUP BY mnemonic
+ORDER BY trace_dur_us DESC LIMIT 20;
+
+-- 4. Top executed source locations (innermost frame)
+SELECT file, line, n_events, ROUND(dur_sum_us,2) AS dur_us
+FROM v_exec_location ORDER BY dur_sum_us DESC LIMIT 20;
+
+-- 5. Top kernel call sites (outermost frame)
+SELECT file, line, n_events, ROUND(dur_sum_us,2) AS dur_us
+FROM v_kernel_location ORDER BY dur_sum_us DESC LIMIT 20;
+
+-- 6. Top instructions, including their source mapping
+SELECT addr, mnemonic, pipe, src, calls, cycles, trace_n,
+       ROUND(trace_dur_us,2) AS trace_dur_us
+FROM v_instruction ORDER BY trace_dur_us DESC LIMIT 20;
+
+-- 7. One core, one time window
+SELECT e.ts, e.dur, e.ph,
+       (SELECT name FROM names WHERE id = e.name_id) AS name,
+       (SELECT code FROM code_stacks WHERE id = e.code_id) AS code
+FROM events e
+WHERE e.core_id = (SELECT id FROM cores WHERE name='core0.veccore0')
+  AND e.ts BETWEEN 10.0 AND 11.0
+ORDER BY e.ts;
+
+-- 8. Cross-core synchronization spans
+SELECT n.name, COUNT(*) AS count, ROUND(SUM(s.dur),2) AS dur_sum_us,
+       ROUND(MAX(s.dur),4) AS dur_max_us
+FROM spans s JOIN names n ON n.id = s.name_id
+GROUP BY s.name_id ORDER BY SUM(s.dur) DESC;
+
+-- 9. Timeline load per pipe (bucket size is the build --bucket-us)
+SELECT h.bucket_start_us, COALESCE(p.name,'') AS pipe,
+       h.count, ROUND(h.dur_sum_us,3) AS dur_us
+FROM timeline_hist h LEFT JOIN pipes p ON p.id = h.pipe_id
+ORDER BY h.bucket_start_us, h.pipe_id;
+
+-- 10. Which source line does the hottest instruction belong to?
+SELECT addr, mnemonic, pipe, src, ROUND(trace_dur_us,2) AS trace_dur_us
+FROM v_instruction ORDER BY trace_dur_us DESC LIMIT 10;
+"""
+    with open(os.path.join(out_dir, "queries.sql"), "w", encoding="utf-8") as f:
+        f.write(queries)
+
+
+README = """\
+# perfp output bundle
+
+This directory was produced by `perfp`, a zero-dependency preprocessor for
+Ascend simulator `visualize_data.bin` dumps.  It is designed so that an AI
+agent can answer performance questions without ever loading the 300 MB binary.
+
+## Read me first
+
+1. `summary.md`  -- compact digest: trace shape, pipe/core balance, top
+   mnemonics, top source locations, sync spans, caveats.
+2. `profile.sqlite` -- the full, queryable dataset.  Prefer SQL over CSV.
+3. `csv/` -- exported tables for grep/awk.  `events.csv.gz` is the full event
+   stream (dictionary encoded: `code_id` -> `csv/code_stacks.csv`).
+4. `raw/trace.json.gz` -- the original timeline, losslessly preserved.
+   Only decompress it if you need to replay the exact event stream.
+5. `src/` -- source files embedded in the dump (including `kernel.asc`).
+   `src/MANIFEST.csv` maps original absolute path -> local file.
+
+## SQLite schema (main tables)
+
+| table | rows | meaning |
+|---|---|---|
+| `meta` | key/value | build info |
+| `cores` | one per core | name, event count, accumulated `dur` |
+| `pipes` | one per pipe | name, event count, accumulated `dur` |
+| `names` | one per event name | mostly instruction mnemonics |
+| `code_stacks` | ~1k | full multi-line `args.code` stack, inner/outer location, aggregated |
+| `locations` | few k | single `file:line` (instruction source mapping) |
+| `details` | ~80k | `args.detail` strings |
+| `pcs` | ~2k | `args.pc_addr`, aggregated |
+| `events` | ~600k | ts, dur, ph, core/pipe/name/code/detail/pc ids |
+| `spans` | ~10k | matched B/E pairs (sync flags) |
+| `instructions` | ~2k | static instruction table from record 30 |
+| `instruction_core` | ~90k | per instruction x per core counters |
+| `files` / `file_lines` | ~30 / ~600 | record 29 per-line statistics |
+| `timeline_hist` | small | histogram of events over time |
+
+Convenience views:
+
+- `v_instruction`   -- instructions joined with per-core counters and trace latency
+- `v_code_line`     -- per `file:line` instruction accounting
+- `v_code_line_core`-- same, per core
+- `v_exec_location` -- trace latency grouped by innermost stack frame
+- `v_kernel_location` -- trace latency grouped by outermost (user kernel) frame
+
+All `*_id` columns are small integers.  Join to `cores`, `pipes`, `names`,
+`code_stacks`, `details`, `pcs` for text.
+
+## Metric semantics (important)
+
+- `events.dur` is the per-instruction latency reported by the simulator.  Sums
+  over pipes/cores **overlap**, so they can exceed wall time.  Use it for
+  *relative* hotspots, not elapsed time.
+- `instruction_core.cycles` is simulator-internal accounting.  It is **not**
+  core clock cycles and must not be converted to microseconds.  `perfp` emits a
+  warning in `summary.md` when the implied frequency is implausible.
+- `spans.dur` is a real `E.ts - B.ts` duration for matched sync flags.
+
+## Reproduce
+
+```bash
+./perfp <case-or-OPPROF-dir-or-bin> -o perfp_out
+./perfp info <bin>            # show the container record table
+./perfp <input> -o out --force --no-events-csv --raw-plain
+./perfp <input> -o out --events-csv-plain   # events.csv instead of .gz
+```
+"""
+
+
+def build(args):
+    global db_path_global, out_global, QUIET
+
+    QUIET = bool(getattr(args, "quiet", False))
+    t_start = time.time()
+    bin_path = find_bin(args.input)
+    bin_size = os.path.getsize(bin_path)
+    out_dir = prepare_out(args.out, args.force)
+    out_global = out_dir
+
+    db_path = os.path.join(out_dir, "profile.sqlite")
+    db_path_global = db_path
+    db = sqlite3.connect(db_path)
+    db.executescript(DDL)
+
+    case_json, sim_log = find_case_files(bin_path)
+    meta = {
+        "perfp_version": VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "input": bin_path,
+        "bin_size": bin_size,
+        "bucket_us": args.bucket_us,
+        "top_n": args.top,
+        "case": case_json,
+    }
+
+    ctx = Ctx()
+    with open(bin_path, "rb") as f:
+        records = list(iter_records(f, bin_size))
+        meta["records"] = len(records)
+
+        by_type = Counter(r.type for r in records)
+        eprint(f"[perfp] {len(records)} records: "
+               + ", ".join(f"type{t}={n}" for t, n in sorted(by_type.items())))
+
+        trace_recs = [r for r in records if r.type == TYPE_TRACE]
+        instr_recs = [r for r in records if r.type == TYPE_INSTRUCTIONS]
+        files_recs = [r for r in records if r.type == TYPE_FILES]
+        source_recs = [r for r in records if r.type == TYPE_SOURCE]
+
+        if not trace_recs:
+            raise PerfpError("no trace record (type=2) found in container")
+
+        if not args.no_raw:
+            write_raw_trace(f, trace_recs[0], out_dir, plain=args.raw_plain)
+        write_raw_records(f, records, out_dir)
+
+        # trace
+        tr = trace_recs[0]
+        f.seek(tr.payload)
+        payload = f.read(tr.length)
+        ingest_trace(payload, ctx, db, args.bucket_us, args.top)
+        del payload
+
+        # instructions
+        if instr_recs:
+            ingest_instructions(f, instr_recs[0], ctx, db)
+
+        # embedded sources
+        if not args.no_src and source_recs:
+            extract_sources(f, source_recs, out_dir, ctx)
+
+        # files table
+        if files_recs:
+            ingest_files(f, files_recs[0], ctx, db)
+
+    finalize_db(db, ctx, args.bucket_us)
+
+    export_csvs(db, out_dir, ctx, want_events=not args.no_events_csv,
+                top_n=args.top, events_plain=args.events_csv_plain)
+
+    # optional sim log cross-check (after export_csvs creates csv/)
+    if sim_log:
+        rows = parse_simlog(sim_log)
+        if rows:
+            write_csv(os.path.join(out_dir, "csv", "cores_simlog.csv"),
+                      ["core_name", "duration_time_us", "running_time_us"], rows)
+            meta["simlog"] = os.path.basename(sim_log)
+            eprint(f"[perfp] sim log: {len(rows)} cores")
+
+    # write small metadata + docs
+    write_meta_files(out_dir, meta)
+    with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8") as f:
+        f.write(README)
+
+    meta_rows = [(k, json.dumps(v, ensure_ascii=False)
+                  if isinstance(v, (dict, list)) else ("" if v is None else str(v)))
+                 for k, v in meta.items()]
+    db.executemany("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                   meta_rows)
+    db.commit()
+
+    build_summary(db, out_dir, ctx, meta)
+
+    try:
+        db.execute("ANALYZE")
+        db.commit()
+    except sqlite3.Error:
+        pass
+
+    # final stats
+    db_size = os.path.getsize(db_path)
+    db.close()
+    total = sum(os.path.getsize(os.path.join(dp, fn))
+                for dp, _dn, fns in os.walk(out_dir) for fn in fns)
+    eprint(f"[perfp] done in {time.time() - t_start:.1f}s: "
+           f"{human(total)} total, sqlite {human(db_size)} -> {out_dir}")
+    eprint("[perfp] start with: " + os.path.join(out_dir, "summary.md"))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# info
+# --------------------------------------------------------------------------
+
+def info(args):
+    bin_path = find_bin(args.input)
+    size = os.path.getsize(bin_path)
+    recs = []
+    with open(bin_path, "rb") as f:
+        for rec in iter_records(f, size):
+            f.seek(rec.payload)
+            head = f.read(min(48, rec.length))
+            recs.append((rec, head))
+
+    if args.json:
+        out = []
+        for rec, head in recs:
+            out.append({
+                "index": rec.index,
+                "offset": rec.offset,
+                "length": rec.length,
+                "type": rec.type,
+                "subtype": rec.subtype,
+                "head": head.decode("utf-8", "replace"),
+            })
+        print(json.dumps({"path": bin_path, "size": size, "records": out},
+                         indent=2))
+        return 0
+
+    print(f"{bin_path}  ({human(size)})")
+    print(f"{'idx':>3} {'offset':>12} {'length':>12} {'type':>4} {'sub':>4}  head")
+    for rec, head in recs:
+        text = head.decode("utf-8", "replace").replace("\n", " ")[:40]
+        print(f"{rec.index:>3} {rec.offset:>12} {rec.length:>12} "
+              f"{rec.type:>4} {rec.subtype:>4}  {text}")
+    by_type = Counter(r.type for r, _ in recs)
+    total = sum(1 for _ in recs)
+    print(f"\n{total} records; by type: "
+          + ", ".join(f"{t}:{n}" for t, n in sorted(by_type.items())))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Allow `perfp <input> ...` as a shorthand for `perfp build <input> ...`.
+    if argv and argv[0] not in ("build", "info", "-h", "--help", "--version"):
+        argv = ["build"] + argv
+
+    ap = argparse.ArgumentParser(
+        prog="perfp",
+        description="preprocess Ascend simulator visualize_data.bin into an "
+                    "agent-friendly SQLite + summary + CSV bundle",
+        epilog="examples:\n"
+               "  perfp /data/smoke_p03 -o perfp_out\n"
+               "  perfp build /data/OPPROF_*/simulator/visualize_data.bin "
+               "-o out --force\n"
+               "  perfp info /data/smoke_p03\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"perfp {VERSION}")
+
+    sub = ap.add_subparsers(dest="cmd")
+
+    b = sub.add_parser("build", help="build the analysis bundle (default)")
+    b.add_argument("input", help="bin file, OPPROF dir, or case dir")
+    b.add_argument("-o", "--out", default="perfp_out",
+                   help="output directory (default: perfp_out)")
+    b.add_argument("--bucket-us", type=float, default=0.5,
+                   help="timeline histogram bucket in us (default: 0.5)")
+    b.add_argument("--top", type=int, default=30,
+                   help="number of rows in top-N tables (default: 30)")
+    b.add_argument("--force", action="store_true",
+                   help="replace a non-empty output directory")
+    b.add_argument("--no-raw", action="store_true",
+                   help="do not keep the raw timeline")
+    b.add_argument("--raw-plain", action="store_true",
+                   help="keep raw timeline as plain trace.json (not .gz)")
+    b.add_argument("--no-src", action="store_true",
+                   help="do not extract embedded sources")
+    b.add_argument("--no-events-csv", action="store_true",
+                   help="skip the full events.csv(.gz) export")
+    b.add_argument("--events-csv-plain", action="store_true",
+                   help="write events.csv instead of events.csv.gz")
+    b.add_argument("--quiet", action="store_true")
+
+    i = sub.add_parser("info", help="show the container record table")
+    i.add_argument("input")
+    i.add_argument("--json", action="store_true")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "build":
+        return build(args)
+    if args.cmd == "info":
+        return info(args)
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except PerfpError as e:
+        eprint(f"perfp: error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        eprint("perfp: interrupted")
+        sys.exit(130)
