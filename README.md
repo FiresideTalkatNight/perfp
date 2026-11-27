@@ -13,6 +13,32 @@ Chrome Trace JSON + 若干二进制记录）转换成 **AI agent 可以直接分
 只依赖 Python 3 标准库（`sqlite3`、`json`、`gzip`、`csv`、`struct` 等），
 不需要 `pandas` / `pyarrow` / `duckdb`。
 
+## 0.2：面向 agent 的分析入口
+
+- **先读 `overview.md`**：短摘要、数据质量状态、热点线索和下一步查询。
+- **时间字段明确分开**：事件起始范围与包含 X 事件结束的覆盖范围都不是
+  真机算子耗时；`device_task_duration_us` 保持 `null`，不从模拟器推算。
+- **机器可读语义与诊断**：`summary.json.metric_semantics` 和 `quality` 提供
+  指标解释、执行计数差值/比例/每核明细、未配对同步及缺失源码栈数量。
+- **多 kernel 批处理**：`--all` 处理目录下全部 `visualize_data.bin`，生成
+  `index.md` / `index.json`；单个失败仍保留其他结果，但命令返回非零。
+  不加 `--all` 时，多份输入会报错，避免漏看 kernel。
+- 输入 SHA-256 写入元数据及摘要，用于确认分析对象；禁止输出覆盖输入目录。
+
+兼容性：保留 `trace.wall_us` 作为 **已弃用的事件起始范围别名**，过滤元数据事件。
+新代码应使用下表中的明确字段，不应把旧字段当作 wall-clock 时间。
+
+| 字段 | 含义 |
+|---|---|
+| `trace.event_start_range_us` | 非元数据事件的 `MAX(ts)-MIN(ts)` |
+| `trace.event_coverage_us` | 包含 X 事件 `ts+dur` 的覆盖范围；其他事件使用 `ts` |
+| `trace.device_task_duration_us` | 此模拟器输入无法提供，固定为 `null` |
+| `pipes[].share` | 累计指令延迟占比，不是利用率或关键路径占比 |
+| `quality.status` | `ok` / `caution`：已实现的结构/计数检查结果，不是物理模型准确度保证 |
+
+计数不一致的原因可能涉及生产端统计口径、映射或解析；工具不会据此断言丢失事件。
+`cycles` 的真实时钟含义尚未验证，不能换算微秒。热点排名不等于已证明的性能瓶颈。
+
 ---
 
 ## 快速开始
@@ -20,6 +46,9 @@ Chrome Trace JSON + 若干二进制记录）转换成 **AI agent 可以直接分
 ```bash
 # 输入可以是 case 目录、OPPROF 目录，或直接指向 visualize_data.bin
 ./perfp /path/to/smoke_p03 -o perfp_out
+
+# 多 kernel / 多次调用：分别处理，并生成顶层索引
+./perfp /path/to/OPPROF -o perfp_batch --all
 
 # 只看容器里有哪些记录
 ./perfp info /path/to/smoke_p03
@@ -56,6 +85,7 @@ sqlite3 perfp_out/profile.sqlite
 
 ```
 perfp_out/
+  overview.md               # agent 短入口：质量、热点与下一步查询
   README.md                 # 这份 bundle 的 schema / 用法（英文，方便 agent）
   summary.md                # 给人 / LLM 看的摘要
   summary.json              # 同样的数字，机器可读
@@ -148,9 +178,10 @@ type == 1（内嵌源码）后面再跟 4096 字节 0 填充
 - `instruction_core.cycles` 是模拟器内部计数，**不是核时钟周期**，不能换算成
   微秒。`perfp` 会在 `summary.md` 里自动检测并给出警告（本样本约 4.9e4
   cycles/us，明显不是真实频率）。
-- `spans.dur` 是匹配到的 `E.ts - B.ts`，是真实时长。
-- 事件分解：`X` 事件 605,420 + `B/E` span 10,108 = 615,528 = `Instructions
-  Executed` 总和。这三者对不上时 `perfp` 会给出警告。
+- `spans.dur` 是匹配到的 `E.ts - B.ts`，是模拟器时间线上同步区间的跨度，
+  不应称为真机时长。负跨度、缺失时间和未配对端点会计入质量诊断。
+- 旧样本中：`X` 事件 605,420 + `B/E` span 10,108 = 615,528 = `Instructions
+  Executed` 总和。这不是所有生产端版本都成立的恒等式；不一致时输出量化诊断。
 
 ---
 
@@ -177,3 +208,14 @@ type == 1（内嵌源码）后面再跟 4096 字节 0 填充
   类型会被跳过（`info` 里仍可见）。
 - 只解析 `traceEvents` 数组；外层的 `displayTimeUnit/profilingType/schemaVersion`
   保留在 raw 文件里，没有单独建表。
+- 一个容器中出现多份 trace / Instructions / Files 记录时会拒绝分析，避免静默忽略后续记录。
+
+## 测试
+
+```bash
+# 独立生成不同形态的容器，不需要 CANN 或旧样本
+python3 -m unittest -v test_agent_features.py
+
+# 可选：原始大样本的固定计数回归；没有样本会明确跳过
+PERFP_SAMPLE=/path/to/original/smoke_p03 python3 test_perfp.py
+```

@@ -41,7 +41,9 @@ import csv
 import glob
 import gzip
 import heapq
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -51,7 +53,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 
 REC_HDR = struct.Struct("<IIBB2s")
@@ -178,7 +180,7 @@ def find_bin(path):
     if not cands:
         raise PerfpError(f"could not find visualize_data.bin under {path}")
     if len(cands) > 1:
-        eprint(f"[perfp] warning: {len(cands)} candidates, using {cands[0]}")
+        raise PerfpError(f"{len(cands)} candidate files under {path}; use --all or specify one bin")
     return cands[0]
 
 
@@ -229,6 +231,10 @@ class Ctx:
         self.event_count = 0
         self.ts_min = None
         self.ts_max = None
+        self.ts_end = None
+        self.unmatched_ends = 0
+        self.invalid_spans = 0
+        self.invalid_times = 0
         self.source_local = {}    # original path -> relative file under src/
         self.warnings = []
 
@@ -286,9 +292,11 @@ def ingest_trace(payload, ctx, db, bucket_us, top_n):
             ph = "" if ph is None else str(ph)
 
         raw_ts = obj.get("ts")
-        ts = raw_ts if isinstance(raw_ts, (int, float)) else None
+        ts = raw_ts if isinstance(raw_ts, (int, float)) and math.isfinite(raw_ts) else None
         raw_dur = obj.get("dur")
-        dur = raw_dur if isinstance(raw_dur, (int, float)) else None
+        dur = raw_dur if isinstance(raw_dur, (int, float)) and math.isfinite(raw_dur) and raw_dur >= 0 else None
+        if (raw_ts is not None and ts is None) or (raw_dur is not None and dur is None):
+            ctx.invalid_times += 1
 
         pid_raw = obj.get("pid")
         tid_raw = obj.get("tid")
@@ -338,7 +346,7 @@ def ingest_trace(payload, ctx, db, bucket_us, top_n):
             st[1] += 1
         if dur is not None:
             st[2] += dur
-        if ts is not None:
+        if ts is not None and ph != "M":
             if st[3] is None or ts < st[3]:
                 st[3] = ts
             if st[4] is None or ts > st[4]:
@@ -347,6 +355,9 @@ def ingest_trace(payload, ctx, db, bucket_us, top_n):
                 ctx.ts_min = ts
             if ctx.ts_max is None or ts > ctx.ts_max:
                 ctx.ts_max = ts
+            end = ts + (dur or 0.0) if ph == "X" else ts
+            if ctx.ts_end is None or end > ctx.ts_end:
+                ctx.ts_end = end
 
         bump2(ctx.pipe_stats, pid, 1, dur or 0.0)
         nst = ctx.name_stats.get(nid)
@@ -379,9 +390,15 @@ def ingest_trace(payload, ctx, db, bucket_us, top_n):
                     lst = ctx.open_spans.get(key)
                     if lst:
                         b_nid, b_pid, b_ts = lst.pop()
-                        if ts is not None and b_ts is not None:
+                        if ts is not None and b_ts is not None and ts >= b_ts:
                             ctx.spans.append((cid, str(group), b_nid, b_pid,
                                               b_ts, ts - b_ts))
+                        else:
+                            ctx.invalid_spans += 1
+                    else:
+                        ctx.unmatched_ends += 1
+            else:
+                ctx.invalid_spans += 1
 
         if dur is not None and top_n > 0:
             item = (dur, eid, ts, ph, nid, cid, pid, pcid, sid)
@@ -1085,6 +1102,7 @@ def build_summary(db, out_dir, ctx, meta):
     ts_min = ctx.ts_min
     ts_max = ctx.ts_max
     wall = (ts_max - ts_min) if (ts_min is not None and ts_max is not None) else None
+    coverage = ctx.ts_end - ts_min if ts_min is not None else None
 
     total_calls = q1(cur, "SELECT SUM(calls) FROM instruction_core") or 0
     total_cycles = q1(cur, "SELECT SUM(cycles) FROM instruction_core") or 0
@@ -1095,6 +1113,41 @@ def build_summary(db, out_dir, ctx, meta):
     accounted = x_events + span_count
 
     warnings = list(ctx.warnings)
+    unmatched_begins = sum(len(v) for v in ctx.open_spans.values())
+    instruction_rows = q1(cur, "SELECT COUNT(*) FROM instructions") or 0
+    core_accounting = []
+    for cid, name in cur.execute("SELECT id,name FROM cores ORDER BY id").fetchall():
+        counter = q1(cur, "SELECT SUM(calls) FROM instruction_core WHERE core_id=?", (cid,))
+        trace_count = q1(cur, "SELECT COUNT(*) FROM events WHERE core_id=? AND ph='X'", (cid,))
+        trace_count += q1(cur, "SELECT COUNT(*) FROM spans WHERE core_id=?", (cid,))
+        core_accounting.append({"core": name, "counter_calls": counter,
+                                "trace_executions": trace_count,
+                                "delta": trace_count - counter if counter is not None else None})
+    quality = {
+        "instruction_counters_available": bool(instruction_rows),
+        "counter_calls": int(total_calls) if instruction_rows else None,
+        "trace_executions": accounted,
+        "execution_count_delta": accounted - total_calls if instruction_rows else None,
+        "execution_count_delta_pct": 100 * (accounted - total_calls) / total_calls if total_calls else None,
+        "per_core_accounting": core_accounting,
+        "unmatched_sync_begins": unmatched_begins,
+        "unmatched_sync_ends": ctx.unmatched_ends,
+        "invalid_sync_spans": ctx.invalid_spans,
+        "invalid_time_events": ctx.invalid_times,
+        "x_events_without_source_stack": q1(cur, "SELECT COUNT(*) FROM events WHERE ph='X' AND code_id IS NULL"),
+        "status": "ok",
+    }
+    missing_source = quality["x_events_without_source_stack"]
+    quality["x_source_stack_coverage_pct"] = 100 * (x_events - missing_source) / x_events if x_events else None
+    if missing_source:
+        warnings.append(f"{missing_source} of {x_events} X events have no source stack; source-hotspot attribution is incomplete.")
+    if not instruction_rows:
+        warnings.append("Instruction counters are unavailable; execution-count reconciliation cannot be performed.")
+    if unmatched_begins or ctx.unmatched_ends or ctx.invalid_spans:
+        warnings.append(f"Incomplete synchronization data: {unmatched_begins} unmatched begins, "
+                        f"{ctx.unmatched_ends} unmatched ends, {ctx.invalid_spans} invalid spans.")
+    if ctx.invalid_times:
+        warnings.append(f"{ctx.invalid_times} events contain invalid timestamps/durations; invalid values were excluded from time aggregates.")
     if wall and per_core_cycles and per_core_cycles / wall > 5000:
         warnings.append(
             f"`cycles` looks like simulator-internal accounting, not core "
@@ -1105,21 +1158,29 @@ def build_summary(db, out_dir, ctx, meta):
         warnings.append(
             "Accumulated per-core dur exceeds wall time: instruction "
             "latencies overlap across pipes, so SUM(dur) is not elapsed time.")
-    if total_calls and accounted != total_calls:
+    if instruction_rows and accounted != total_calls:
+        delta_pct = f"{100 * (accounted - total_calls) / total_calls:+.2f}%" if total_calls else "percentage unavailable: zero counter total"
         warnings.append(
             f"accounted executions (X events {x_events:,} + B/E spans "
             f"{span_count:,} = {accounted:,}) != summed instruction "
-            f"executions ({int(total_calls):,}); a few events are unmatched.")
+            f"executions ({int(total_calls):,}); delta={accounted - total_calls:+,} "
+            f"({delta_pct}). "
+            "Cause is unknown: counter semantics, mapping or parsing may differ; see quality.per_core_accounting.")
     if n_cores and min(core_durs) > 0:
         spread = max(core_durs) / min(core_durs)
         if spread > 1.05:
-            warnings.append(f"core imbalance detected: max/min per-core dur "
-                            f"= {spread:.3f}")
+            warnings.append(f"Accumulated instruction-latency imbalance: max/min per-core SUM(dur) "
+                            f"= {spread:.3f}; not execution-time imbalance.")
+
+    if (not instruction_rows or (instruction_rows and accounted != total_calls)
+            or unmatched_begins or ctx.unmatched_ends or ctx.invalid_spans or ctx.invalid_times or missing_source):
+        quality["status"] = "caution"
 
     summary = {
         "perfp_version": VERSION,
         "schema_version": SCHEMA_VERSION,
         "input": meta.get("input"),
+        "input_sha256": meta.get("input_sha256"),
         "bin_size": meta.get("bin_size"),
         "records": meta.get("records"),
         "case": meta.get("case"),
@@ -1130,6 +1191,10 @@ def build_summary(db, out_dir, ctx, meta):
             "ts_min": ts_min,
             "ts_max": ts_max,
             "wall_us": wall,
+            "event_start_range_us": wall,
+            "event_coverage_us": coverage,
+            "event_end_max_us": ctx.ts_end,
+            "device_task_duration_us": None,
             "code_stacks": len(ctx.stacks.items),
             "locations": len(ctx.locations.items),
             "details": len(ctx.details.items),
@@ -1186,6 +1251,16 @@ def build_summary(db, out_dir, ctx, meta):
             ],
         },
         "warnings": warnings,
+        "quality": quality,
+        "metric_semantics": {
+            "wall_us": "Deprecated alias of event_start_range_us; not kernel elapsed time.",
+            "event_start_range_us": "MAX(ts)-MIN(ts), excluding metadata events.",
+            "event_coverage_us": "MAX(X.ts+X.dur, other.ts)-MIN(ts), excluding metadata; simulator event extent, not device task duration.",
+            "dur_sum_us": "Accumulated instruction latency; overlapping across instructions/pipes/cores, not utilization or critical-path time.",
+            "share": "Share of accumulated instruction latency, not fraction of elapsed time.",
+            "cycles": "Producer counter with unverified clock semantics; do not convert to microseconds.",
+            "device_task_duration_us": "Unavailable from this simulator trace; null, never inferred.",
+        },
     }
 
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -1201,8 +1276,9 @@ def build_summary(db, out_dir, ctx, meta):
 
     add("## Headline\n")
     if wall is not None:
-        add(f"- **{n_cores} cores**, {n_events:,} events, wall **{wall:.2f} us** "
-            f"({ts_min:.3f} .. {ts_max:.3f} us).")
+        add(f"- **{n_cores} cores**, {n_events:,} events, event coverage **{coverage:.2f} us** "
+            f"({ts_min:.3f} .. {ctx.ts_end:.3f} us); not device task duration.")
+    add(f"- data quality: **{quality['status']}**; see `summary.json` → `quality`.")
     if pipes:
         pn, pn_events, pd = pipes[0]
         add(f"- dominant pipe: **{pn or '(none)'}** -- "
@@ -1235,8 +1311,7 @@ def build_summary(db, out_dir, ctx, meta):
                                   for k, v in ph_counts.most_common()))
     add(f"- cores: **{n_cores}**, distinct pipes: {len(pipes)}")
     if wall is not None:
-        add(f"- time range: {ts_min:.4f} .. {ts_max:.4f} us "
-            f"(wall {wall:.2f} us)")
+        add(f"- event-start range: {wall:.4f} us; event coverage: {coverage:.4f} us (neither is calibrated device elapsed time)")
     add(f"- distinct instruction PCs: {len(ctx.pcs.items):,}")
     add(f"- distinct source stacks: {len(ctx.stacks.items):,}, "
         f"instruction source locations: {len(ctx.locations.items):,}")
@@ -1351,6 +1426,24 @@ def build_summary(db, out_dir, ctx, meta):
 
     with open(os.path.join(out_dir, "summary.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(L))
+
+    overview = [f"# perfp overview — {title}", "",
+                f"- Quality: **{quality['status']}**. Cores: {n_cores}; events: {n_events:,}.",
+                f"- Event coverage: {fmt_num(coverage)} us; device task duration: unavailable.",
+                "- All latency shares overlap; they are not utilization or speedup estimates.", "",
+                "## Hotspot leads (not proven bottlenecks)", ""]
+    for r in summary["top_mnemonics"][:3]:
+        overview.append(f"- `{r['mnemonic']}`: {fmt_num(r['trace_dur_us'])} us accumulated latency.")
+    overview += ["", "## Data quality", ""] + [f"- {w}" for w in warnings[:5]]
+    if len(warnings) > 5:
+        overview.append("- More caveats in summary.md; full diagnostics in summary.json.")
+    overview += ["", "## Next queries", "",
+                 "1. Use queries.sql #5/#6 to connect hotspots to source and instructions.",
+                 "2. Use #7 to inspect a specific core/time window, and #8 for sync waits.",
+                 "3. Inspect quality.per_core_accounting before comparing counter-derived totals.",
+                 "4. Verify any optimization hypothesis with an independent device timing run.", ""]
+    with open(os.path.join(out_dir, "overview.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(overview))
 
     eprint(f"[perfp] summary: {os.path.getsize(os.path.join(out_dir, 'summary.md'))} bytes")
 
@@ -1549,14 +1642,15 @@ agent can answer performance questions without ever loading the 300 MB binary.
 
 ## Read me first
 
-1. `summary.md`  -- compact digest: trace shape, pipe/core balance, top
+1. `overview.md` -- short entry point: quality, hotspot leads and next queries.
+2. `summary.md`  -- full digest: trace shape, pipe/core balance, top
    mnemonics, top source locations, sync spans, caveats.
-2. `profile.sqlite` -- the full, queryable dataset.  Prefer SQL over CSV.
-3. `csv/` -- exported tables for grep/awk.  `events.csv.gz` is the full event
+3. `profile.sqlite` -- the full, queryable dataset.  Prefer SQL over CSV.
+4. `csv/` -- exported tables for grep/awk.  `events.csv.gz` is the full event
    stream (dictionary encoded: `code_id` -> `csv/code_stacks.csv`).
-4. `raw/trace.json.gz` -- the original timeline, losslessly preserved.
+5. `raw/trace.json.gz` -- the original timeline, losslessly preserved.
    Only decompress it if you need to replay the exact event stream.
-5. `src/` -- source files embedded in the dump (including `kernel.asc`).
+6. `src/` -- source files embedded in the dump (including `kernel.asc`).
    `src/MANIFEST.csv` maps original absolute path -> local file.
 
 ## SQLite schema (main tables)
@@ -1591,13 +1685,20 @@ All `*_id` columns are small integers.  Join to `cores`, `pipes`, `names`,
 
 ## Metric semantics (important)
 
+- `summary.json.metric_semantics` documents metric meanings in machine-readable form.
+- `event_start_range_us` excludes metadata and measures the range of event start timestamps.
+- `event_coverage_us` includes X-event durations; it is a simulator event extent,
+  NOT device kernel elapsed time. `wall_us` is a deprecated alias of the start range.
+- `device_task_duration_us` is null: no device duration is inferred from this trace.
+- `summary.json.quality` reports counter deltas, per-core accounting, missing source
+  stacks and incomplete synchronization. A mismatch does not prove data loss.
 - `events.dur` is the per-instruction latency reported by the simulator.  Sums
   over pipes/cores **overlap**, so they can exceed wall time.  Use it for
   *relative* hotspots, not elapsed time.
 - `instruction_core.cycles` is simulator-internal accounting.  It is **not**
   core clock cycles and must not be converted to microseconds.  `perfp` emits a
   warning in `summary.md` when the implied frequency is implausible.
-- `spans.dur` is a real `E.ts - B.ts` duration for matched sync flags.
+- `spans.dur` is `E.ts - B.ts` on the simulator timeline, not real-device duration.
 
 ## Reproduce
 
@@ -1617,6 +1718,9 @@ def build(args):
     t_start = time.time()
     bin_path = find_bin(args.input)
     bin_size = os.path.getsize(bin_path)
+    output_path = os.path.realpath(args.out)
+    if os.path.commonpath([output_path, os.path.realpath(bin_path)]) == output_path:
+        raise PerfpError("output directory contains the input file; refusing to overwrite input")
     out_dir = prepare_out(args.out, args.force)
     out_global = out_dir
 
@@ -1636,6 +1740,11 @@ def build(args):
         "top_n": args.top,
         "case": case_json,
     }
+    digest = hashlib.sha256()
+    with open(bin_path, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    meta["input_sha256"] = digest.hexdigest()
 
     ctx = Ctx()
     with open(bin_path, "rb") as f:
@@ -1650,6 +1759,10 @@ def build(args):
         instr_recs = [r for r in records if r.type == TYPE_INSTRUCTIONS]
         files_recs = [r for r in records if r.type == TYPE_FILES]
         source_recs = [r for r in records if r.type == TYPE_SOURCE]
+        for label, selected in (("trace", trace_recs), ("instructions", instr_recs), ("files", files_recs)):
+            if len(selected) > 1:
+                db.close()
+                raise PerfpError(f"multiple {label} records in one container are unsupported; refusing partial analysis")
 
         if not trace_recs:
             raise PerfpError("no trace record (type=2) found in container")
@@ -1718,8 +1831,52 @@ def build(args):
                 for dp, _dn, fns in os.walk(out_dir) for fn in fns)
     eprint(f"[perfp] done in {time.time() - t_start:.1f}s: "
            f"{human(total)} total, sqlite {human(db_size)} -> {out_dir}")
-    eprint("[perfp] start with: " + os.path.join(out_dir, "summary.md"))
+    eprint("[perfp] start with: " + os.path.join(out_dir, "overview.md"))
     return 0
+
+
+def build_all(args):
+    """Build an indexed bundle per kernel, keeping failures visible."""
+    root = os.path.realpath(args.input)
+    if not os.path.isdir(root):
+        raise PerfpError("--all requires an input directory")
+    bins = sorted(glob.glob(os.path.join(root, "**", "visualize_data.bin"), recursive=True))
+    if not bins:
+        raise PerfpError(f"no visualize_data.bin under {root}")
+    output = os.path.realpath(args.out)
+    for path in bins:
+        if os.path.commonpath([output, os.path.realpath(path)]) == output:
+            raise PerfpError("output directory contains an input file; refusing to overwrite inputs")
+    out_dir = prepare_out(output, args.force)
+    index = {"perfp_version": VERSION, "input": root, "bundles": []}
+    for number, path in enumerate(bins):
+        relative = os.path.relpath(path, root)
+        label = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.dirname(relative))[-100:] or "kernel"
+        bundle = f"{number:04d}-{label}"
+        entry = {"input": relative, "bundle": bundle}
+        child = argparse.Namespace(**vars(args))
+        child.input, child.out, child.force = path, os.path.join(out_dir, bundle), False
+        try:
+            build(child)
+            with open(os.path.join(child.out, "summary.json"), encoding="utf-8") as f:
+                summary = json.load(f)
+            entry.update({"status": "success", "quality": summary["quality"]["status"],
+                          "event_coverage_us": summary["trace"]["event_coverage_us"]})
+        except (PerfpError, sqlite3.Error, OSError, ValueError) as exc:
+            entry.update({"status": "failed", "error": str(exc)})
+            eprint(f"[perfp] failed {relative}: {exc}")
+        index["bundles"].append(entry)
+        with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2, ensure_ascii=False)
+    lines = ["# perfp batch index", "", "Each kernel/call is a separate bundle; do not sum coverage as device elapsed time.", ""]
+    for entry in index["bundles"]:
+        if entry["status"] == "success":
+            lines.append(f"- [{entry['bundle']}]({entry['bundle']}/overview.md): quality={entry['quality']}; input `{entry['input']}`")
+        else:
+            lines.append(f"- **FAILED** `{entry['input']}`: {entry['error']}")
+    with open(os.path.join(out_dir, "index.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return int(any(e["status"] == "failed" for e in index["bundles"]))
 
 
 # --------------------------------------------------------------------------
@@ -1810,6 +1967,7 @@ def main(argv=None):
     b.add_argument("--events-csv-plain", action="store_true",
                    help="write events.csv instead of events.csv.gz")
     b.add_argument("--quiet", action="store_true")
+    b.add_argument("--all", action="store_true", help="process every visualize_data.bin in a directory and write a batch index")
 
     i = sub.add_parser("info", help="show the container record table")
     i.add_argument("input")
@@ -1818,7 +1976,11 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.cmd == "build":
-        return build(args)
+        if not math.isfinite(args.bucket_us) or args.bucket_us <= 0:
+            ap.error("--bucket-us must be finite and greater than zero")
+        if args.top <= 0:
+            ap.error("--top must be greater than zero")
+        return build_all(args) if args.all else build(args)
     if args.cmd == "info":
         return info(args)
     ap.print_help()
