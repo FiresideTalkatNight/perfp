@@ -3175,6 +3175,8 @@ def _fmt_delta(v, digits=2, suffix=""):
 
 
 def compare(args):
+    global QUIET
+    QUIET = bool(getattr(args, "quiet", False))
     sa, dba, pa = _load_bundle(args.a)
     sb, dbb, pb = _load_bundle(args.b)
     label_a = args.label_a or os.path.basename(pa.rstrip("/")) or "A"
@@ -3513,6 +3515,7 @@ def main(argv=None):
                    help="number of stage rows to report (default: 30)")
     c.add_argument("--force", action="store_true",
                    help="replace a non-empty output directory")
+    c.add_argument("--quiet", action="store_true")
 
     i = sub.add_parser("info", help="show the container record table")
     i.add_argument("input")
