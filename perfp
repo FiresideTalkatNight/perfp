@@ -37,6 +37,7 @@ Known record types for this producer:
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import glob
 import gzip
@@ -53,8 +54,8 @@ import sys
 import time
 from collections import Counter, defaultdict
 
-VERSION = "0.2.0"
-SCHEMA_VERSION = 1
+VERSION = "0.3.0"
+SCHEMA_VERSION = 2
 
 REC_HDR = struct.Struct("<IIBB2s")
 TYPE_SOURCE = 1
@@ -63,6 +64,20 @@ TYPE_FILES = 3
 TYPE_INSTRUCTIONS = 4
 PAD_TYPE1 = 4096
 EVENT_BATCH = 20000
+
+# Data-movement pipes. MTE2 is GM->on-chip (input), MTE3 is on-chip->GM
+# (output); MTE1 is L1->L0 and is reported separately when present.
+DMA_PIPES = ("MTE2", "MTE3")
+DMA_DIRECTIONS = {"MTE1": "L1", "MTE2": "IN", "MTE3": "OUT"}
+# Marker/bookkeeping "pipes" that are not real work.  Including them makes
+# every gap look huge because they only emit a handful of events.
+MARKER_PIPES = {"", "ALL", "NA", "EVENT", "USERMARK", "SET_FLAG",
+                "WAIT_FLAG", "set_event", "wait_event", "WARP_-1",
+                "PUSHQ", "CACHEMISS"}
+PRODUCER_NAME_HINTS = ("SET_FLAG", "SET_EVENT", "POST", "ARRIVE", "PRODUCE")
+WAIT_NAME_HINTS = ("WAIT_FLAG", "WAIT_EVENT", "WAIT")
+DEFAULT_GAP_US = 0.1
+WAIT_MATCH_TOL_US = 1e-3
 
 
 # --------------------------------------------------------------------------
@@ -87,6 +102,10 @@ def human(n):
         if abs(n) < 1024.0 or unit == "GB":
             return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
         n /= 1024.0
+
+
+def default_human(value):
+    return human(value or 0)
 
 
 def split_loc(text):
@@ -382,17 +401,19 @@ def ingest_trace(payload, ctx, db, bucket_us, top_n):
                 key = (cid, str(group))
                 if ph == "B":
                     lst = ctx.open_spans.get(key)
+                    item = (nid, pid, ts, eid, sid, did, pcid)
                     if lst is None:
-                        ctx.open_spans[key] = [(nid, pid, ts)]
+                        ctx.open_spans[key] = [item]
                     else:
-                        lst.append((nid, pid, ts))
+                        lst.append(item)
                 else:
                     lst = ctx.open_spans.get(key)
                     if lst:
-                        b_nid, b_pid, b_ts = lst.pop()
+                        b_nid, b_pid, b_ts, b_eid, b_sid, b_did, b_pcid = lst.pop()
                         if ts is not None and b_ts is not None and ts >= b_ts:
                             ctx.spans.append((cid, str(group), b_nid, b_pid,
-                                              b_ts, ts - b_ts))
+                                              b_ts, ts - b_ts, b_eid, eid,
+                                              b_sid, b_did, b_pcid))
                         else:
                             ctx.invalid_spans += 1
                     else:
@@ -695,8 +716,99 @@ CREATE TABLE spans(
     name_id INTEGER,
     pipe_id INTEGER,
     ts REAL,
-    dur REAL
+    dur REAL,
+    b_event_id INTEGER,
+    e_event_id INTEGER,
+    code_id INTEGER,
+    detail_id INTEGER,
+    pc_id INTEGER
 );
+
+CREATE TABLE pipe_segments(
+    id INTEGER PRIMARY KEY,
+    core_id INTEGER,
+    pipe_id INTEGER,
+    ts REAL,
+    dur REAL,
+    n_events INTEGER,
+    first_event_id INTEGER,
+    last_event_id INTEGER
+);
+
+CREATE TABLE pipe_gaps(
+    id INTEGER PRIMARY KEY,
+    core_id INTEGER,
+    pipe_id INTEGER,
+    ts REAL,
+    dur REAL,
+    before_event_id INTEGER,
+    after_event_id INTEGER,
+    prev_end_ts REAL,
+    next_start_ts REAL,
+    attributed_us REAL DEFAULT 0,
+    unattributed_us REAL DEFAULT 0,
+    attributed_waits INTEGER DEFAULT 0,
+    status TEXT,
+    peers TEXT
+);
+
+CREATE TABLE wait_attribution(
+    id INTEGER PRIMARY KEY,
+    span_id INTEGER,
+    core_id INTEGER,
+    consumer_pipe_id INTEGER,
+    consumer_name_id INTEGER,
+    consumer_code_id INTEGER,
+    wait_ts REAL,
+    wait_dur REAL,
+    producer_span_id INTEGER,
+    producer_event_id INTEGER,
+    producer_pipe_id INTEGER,
+    producer_name_id INTEGER,
+    producer_code_id INTEGER,
+    producer_ts REAL,
+    producer_end_ts REAL,
+    delay_us REAL,
+    slack_us REAL,
+    status TEXT,
+    blocks_on_dma INTEGER,
+    gap_id INTEGER
+);
+
+CREATE TABLE dma_events(
+    event_id INTEGER PRIMARY KEY,
+    ts REAL,
+    dur REAL,
+    core_id INTEGER,
+    pipe_id INTEGER,
+    direction TEXT,
+    name_id INTEGER,
+    code_id INTEGER,
+    detail_id INTEGER,
+    pc_id INTEGER,
+    addr TEXT,
+    file TEXT,
+    line INTEGER,
+    outer_file TEXT,
+    outer_line INTEGER,
+    mnemonic TEXT,
+    block_bytes REAL,
+    bytes_source TEXT,
+    buffer_key TEXT,
+    duplicate_key TEXT,
+    repeat_index INTEGER,
+    duplicate_count INTEGER,
+    classification TEXT,
+    stride_bytes REAL,
+    overlap_us REAL
+);
+
+CREATE INDEX idx_events_pipe_ts ON events(pipe_id, ts);
+CREATE INDEX idx_events_core_pipe_ts ON events(core_id, pipe_id, ts);
+CREATE INDEX idx_spans_group ON spans(core_id, group_id);
+CREATE INDEX idx_pipe_gaps_core_pipe ON pipe_gaps(core_id, pipe_id, ts);
+CREATE INDEX idx_wait_gap ON wait_attribution(gap_id);
+CREATE INDEX idx_dma_event ON dma_events(core_id, pipe_id, ts);
 
 CREATE TABLE instructions(
     addr TEXT PRIMARY KEY,
@@ -812,6 +924,191 @@ SELECT outer_file AS file,
 FROM code_stacks
 WHERE outer_file IS NOT NULL
 GROUP BY outer_file, outer_line;
+
+CREATE VIEW v_pipe_activity AS
+SELECT c.name AS core,
+       p.name AS pipe,
+       s.core_id,
+       s.pipe_id,
+       COUNT(*) AS segments,
+       ROUND(SUM(s.dur), 4) AS active_us,
+       MIN(s.ts) AS first_ts,
+       MAX(s.ts + s.dur) AS last_ts,
+       COALESCE(g.gap_count, 0) AS gap_count,
+       ROUND(COALESCE(g.gap_us, 0), 4) AS gap_us,
+       ROUND(COALESCE(g.attributed_us, 0), 4) AS attributed_gap_us,
+       ROUND(COALESCE(g.unattributed_us, 0), 4) AS unattributed_gap_us
+FROM pipe_segments s
+JOIN cores c ON c.id = s.core_id
+JOIN pipes p ON p.id = s.pipe_id
+LEFT JOIN (
+    SELECT core_id, pipe_id, COUNT(*) AS gap_count,
+           SUM(dur) AS gap_us,
+           SUM(attributed_us) AS attributed_us,
+           SUM(unattributed_us) AS unattributed_us
+    FROM pipe_gaps
+    GROUP BY core_id, pipe_id
+) g ON g.core_id = s.core_id AND g.pipe_id = s.pipe_id
+GROUP BY s.core_id, s.pipe_id;
+
+CREATE VIEW v_pipe_gap AS
+SELECT g.id,
+       c.name AS core,
+       p.name AS pipe,
+       g.ts,
+       g.dur,
+       COALESCE(nb.name, '') AS before_name,
+       COALESCE(na.name, '') AS after_name,
+       cb.outer_file AS before_file,
+       cb.outer_line AS before_line,
+       ca.outer_file AS after_file,
+       ca.outer_line AS after_line,
+       g.attributed_us,
+       g.unattributed_us,
+       g.attributed_waits,
+       g.status,
+       g.peers,
+       g.before_event_id,
+       g.after_event_id
+FROM pipe_gaps g
+JOIN cores c ON c.id = g.core_id
+JOIN pipes p ON p.id = g.pipe_id
+LEFT JOIN events eb ON eb.id = g.before_event_id
+LEFT JOIN events ea ON ea.id = g.after_event_id
+LEFT JOIN names nb ON nb.id = eb.name_id
+LEFT JOIN names na ON na.id = ea.name_id
+LEFT JOIN code_stacks cb ON cb.id = eb.code_id
+LEFT JOIN code_stacks ca ON ca.id = ea.code_id;
+
+CREATE VIEW v_wait_attribution AS
+SELECT w.id,
+       c.name AS core,
+       cp.name AS consumer_pipe,
+       cn.name AS consumer_name,
+       cs.inner_file AS consumer_inner_file,
+       cs.inner_line AS consumer_inner_line,
+       cs.outer_file AS consumer_outer_file,
+       cs.outer_line AS consumer_outer_line,
+       w.wait_ts,
+       w.wait_dur,
+       pp.name AS producer_pipe,
+       pn.name AS producer_name,
+       w.producer_event_id,
+       ps.inner_file AS producer_inner_file,
+       ps.inner_line AS producer_inner_line,
+       ps.outer_file AS producer_outer_file,
+       ps.outer_line AS producer_outer_line,
+       w.producer_ts,
+       w.producer_end_ts,
+       w.delay_us,
+       w.slack_us,
+       w.status,
+       w.blocks_on_dma,
+       w.gap_id
+FROM wait_attribution w
+JOIN cores c ON c.id = w.core_id
+LEFT JOIN pipes cp ON cp.id = w.consumer_pipe_id
+LEFT JOIN names cn ON cn.id = w.consumer_name_id
+LEFT JOIN code_stacks cs ON cs.id = w.consumer_code_id
+LEFT JOIN pipes pp ON pp.id = w.producer_pipe_id
+LEFT JOIN names pn ON pn.id = w.producer_name_id
+LEFT JOIN code_stacks ps ON ps.id = w.producer_code_id;
+
+CREATE VIEW v_dma_source AS
+SELECT COALESCE(d.file, '(unknown)') AS file,
+       d.line,
+       p.name AS pipe,
+       d.direction,
+       COUNT(*) AS events,
+       ROUND(SUM(COALESCE(d.block_bytes, 0)), 1) AS bytes_inferred,
+       SUM(CASE WHEN d.block_bytes IS NULL THEN 1 ELSE 0 END)
+           AS events_without_bytes,
+       ROUND(SUM(COALESCE(d.overlap_us, 0)), 4) AS overlap_us,
+       SUM(CASE WHEN d.classification = 'duplicate_candidate' THEN 1 ELSE 0 END)
+           AS duplicate_events,
+       MIN(d.block_bytes) AS min_block_bytes,
+       MAX(d.block_bytes) AS max_block_bytes,
+       COUNT(DISTINCT d.buffer_key) AS buffers
+FROM dma_events d
+JOIN pipes p ON p.id = d.pipe_id
+GROUP BY d.file, d.line, d.pipe_id, d.direction;
+
+CREATE VIEW v_dma_kernel_source AS
+SELECT COALESCE(d.outer_file, '(unknown)') AS file,
+       d.outer_line AS line,
+       p.name AS pipe,
+       d.direction,
+       COUNT(*) AS events,
+       ROUND(SUM(COALESCE(d.block_bytes, 0)), 1) AS bytes_inferred,
+       SUM(CASE WHEN d.block_bytes IS NULL THEN 1 ELSE 0 END)
+           AS events_without_bytes,
+       ROUND(SUM(COALESCE(d.overlap_us, 0)), 4) AS overlap_us,
+       SUM(CASE WHEN d.classification = 'duplicate_candidate' THEN 1 ELSE 0 END)
+           AS duplicate_events
+FROM dma_events d
+JOIN pipes p ON p.id = d.pipe_id
+GROUP BY d.outer_file, d.outer_line, d.pipe_id, d.direction;
+
+CREATE VIEW v_dma_buffer AS
+SELECT d.addr,
+       d.buffer_key,
+       p.name AS pipe,
+       d.direction,
+       COALESCE(d.file, '(unknown)') AS file,
+       d.line,
+       d.outer_file,
+       d.outer_line,
+       COUNT(*) AS events,
+       ROUND(SUM(COALESCE(d.block_bytes, 0)), 1) AS bytes_inferred,
+       MIN(d.block_bytes) AS min_block_bytes,
+       MAX(d.block_bytes) AS max_block_bytes,
+       MIN(d.stride_bytes) AS min_stride_bytes,
+       MAX(d.stride_bytes) AS max_stride_bytes,
+       SUM(CASE WHEN d.classification = 'duplicate_candidate' THEN 1 ELSE 0 END)
+           AS duplicate_events
+FROM dma_events d
+JOIN pipes p ON p.id = d.pipe_id
+GROUP BY d.addr, d.duplicate_key, d.pipe_id, d.direction;
+
+CREATE VIEW v_dma_instruction AS
+SELECT d.addr,
+       d.mnemonic,
+       p.name AS pipe,
+       d.direction,
+       COALESCE(d.file, '(unknown)') AS file,
+       d.line,
+       d.outer_file,
+       d.outer_line,
+       COUNT(*) AS events,
+       ROUND(SUM(COALESCE(d.block_bytes, 0)), 1) AS bytes_inferred,
+       MIN(d.block_bytes) AS min_block_bytes,
+       MAX(d.block_bytes) AS max_block_bytes,
+       ROUND(SUM(COALESCE(d.overlap_us, 0)), 4) AS overlap_us,
+       SUM(CASE WHEN d.classification = 'duplicate_candidate' THEN 1 ELSE 0 END)
+           AS duplicate_events
+FROM dma_events d
+JOIN pipes p ON p.id = d.pipe_id
+GROUP BY d.addr, d.pipe_id, d.direction;
+
+CREATE VIEW v_dma_duplicate AS
+SELECT d.addr,
+       d.buffer_key,
+       d.duplicate_key,
+       p.name AS pipe,
+       d.direction,
+       COALESCE(d.file, '(unknown)') AS file,
+       d.line,
+       d.outer_file,
+       d.outer_line,
+       COUNT(*) AS events,
+       MIN(d.block_bytes) AS block_bytes,
+       ROUND(SUM(COALESCE(d.block_bytes, 0)), 1) AS bytes_inferred,
+       MIN(d.ts) AS first_ts,
+       MAX(d.ts) AS last_ts
+FROM dma_events d
+JOIN pipes p ON p.id = d.pipe_id
+WHERE d.classification = 'duplicate_candidate'
+GROUP BY d.addr, d.buffer_key, d.pipe_id, d.direction;
 """
 
 
@@ -872,8 +1169,9 @@ def finalize_db(db, ctx, bucket_us):
          for i, addr in enumerate(ctx.pcs.items)])
 
     cur.executemany(
-        "INSERT INTO spans(id,core_id,group_id,name_id,pipe_id,ts,dur)"
-        " VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO spans(id,core_id,group_id,name_id,pipe_id,ts,dur,"
+        "b_event_id,e_event_id,code_id,detail_id,pc_id)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         [(i, *s) for i, s in enumerate(ctx.spans)])
 
     cur.executemany(
@@ -882,7 +1180,480 @@ def finalize_db(db, ctx, bucket_us):
         [(b * bucket_us, pid, n, dur)
          for (b, pid), (n, dur) in sorted(ctx.hist.items())])
 
+
+# --------------------------------------------------------------------------
+# pipe activity / gaps / wait attribution / DMA accounting
+# --------------------------------------------------------------------------
+
+def _merge_activity(rows):
+    """Merge (ts, end, event_id) rows into disjoint segments.
+
+    Rows must be sorted by ts.  Returns (start, end, first_event_id,
+    last_event_id, n_events) tuples.  ``last_event_id`` is the event that
+    reaches farthest to the right, not simply the last row seen.
+    """
+    merged = []
+    for ts, end, eid in rows:
+        if end < ts:
+            continue
+        if merged and ts <= merged[-1][1] + 1e-9:
+            cur = merged[-1]
+            if end >= cur[1]:
+                cur = (cur[0], end, cur[2], eid, cur[4] + 1)
+                merged[-1] = cur
+            else:
+                merged[-1] = (cur[0], cur[1], cur[2], cur[3], cur[4] + 1)
+        else:
+            merged.append((ts, end, eid, eid, 1))
+    return merged
+
+
+def _overlap_merged(merged, a, b):
+    """Length of the intersection of [a,b] with disjoint merged segments."""
+    if not merged or b <= a:
+        return 0.0
+    starts = [m[0] for m in merged]
+    i = max(0, bisect.bisect_right(starts, a) - 1)
+    total = 0.0
+    n = len(merged)
+    while i < n and merged[i][0] < b:
+        s, e = merged[i][0], merged[i][1]
+        lo, hi = max(a, s), min(b, e)
+        if hi > lo:
+            total += hi - lo
+        i += 1
+    return total
+
+
+def _union_overlaps(intervals, a, b):
+    """Union length of clipped [start,end] intervals inside [a,b]."""
+    clipped = []
+    for s, e in intervals:
+        lo, hi = max(a, s), min(b, e)
+        if hi > lo:
+            clipped.append((lo, hi))
+    if not clipped:
+        return 0.0
+    clipped.sort()
+    total = clipped[0][1] - clipped[0][0]
+    last = clipped[0][1]
+    for s, e in clipped[1:]:
+        if s > last:
+            total += e - s
+            last = e
+        elif e > last:
+            total += e - last
+            last = e
+    return total
+
+
+def _load_pipe_segments(db):
+    """Load merged X-event activity per (core_id, pipe_id)."""
+    cur = db.cursor()
+    pipe_names = dict(cur.execute("SELECT id,name FROM pipes"))
+    out = defaultdict(list)
+    buf = []
+    key = None
+    sql = ("SELECT core_id,pipe_id,ts,ts+dur,id FROM events "
+           "WHERE ph='X' AND ts IS NOT NULL AND dur IS NOT NULL AND dur>=0 "
+           "ORDER BY core_id,pipe_id,ts,id")
+    for core_id, pipe_id, ts, end, eid in cur.execute(sql):
+        if pipe_names.get(pipe_id) in MARKER_PIPES:
+            continue
+        k = (core_id, pipe_id)
+        if key is not None and k != key:
+            out[key] = _merge_activity(buf)
+            buf = []
+        key = k
+        buf.append((ts, end, eid))
+    if key is not None:
+        out[key] = _merge_activity(buf)
+    return out
+
+
+def _insert_pipe_segments(db, segments):
+    cur = db.cursor()
+    rows = []
+    for (core_id, pipe_id), merged in sorted(segments.items()):
+        for start, end, first_id, last_id, n in merged:
+            rows.append((core_id, pipe_id, start, end - start, n,
+                         first_id, last_id))
+    cur.executemany(
+        "INSERT INTO pipe_segments(core_id,pipe_id,ts,dur,n_events,"
+        "first_event_id,last_event_id) VALUES (?,?,?,?,?,?,?)", rows)
     db.commit()
+    return len(rows)
+
+
+def _is_producer_name(name):
+    u = (name or "").upper()
+    return any(tok in u for tok in PRODUCER_NAME_HINTS)
+
+
+def _is_wait_name(name):
+    u = (name or "").upper()
+    return any(tok in u for tok in WAIT_NAME_HINTS) and not _is_producer_name(u)
+
+
+def _preceding_work(work_list, flag_ts, lookback_us=2.0):
+    """Latest X event on a pipe that finished at/near the producer flag."""
+    if not work_list:
+        return None
+    starts = [w[0] for w in work_list]
+    i = bisect.bisect_right(starts, flag_ts + WAIT_MATCH_TOL_US) - 1
+    best = None
+    j = i
+    floor = flag_ts - max(lookback_us, 60.0)
+    while j >= 0 and j > i - 128 and work_list[j][0] >= floor:
+        w = work_list[j]
+        if w[1] >= flag_ts - lookback_us and (best is None or w[1] > best[1]):
+            best = w
+        j -= 1
+    return best
+
+
+def analyze_wait_attribution(db):
+    """Pair WAIT_FLAG-like spans with SET_FLAG-like spans in the same group.
+
+    The simulator emits B/E pairs whose ``group_id`` is shared by the
+    producer and the consumer of a flag.  A SET_FLAG span is only a tiny
+    marker *after* the real work, so when possible we replace it with the
+    latest X event on the same core+pipe.  That is the instruction (often an
+    MTE2/MTE3 DMA transfer) the consumer actually waited for.
+    """
+    cur = db.cursor()
+    waits = []
+    producers = defaultdict(list)
+    sql = ("SELECT s.id,s.core_id,s.group_id,s.name_id,n.name,s.pipe_id,"
+           "s.ts,s.dur,s.code_id FROM spans s JOIN names n ON n.id=s.name_id "
+           "WHERE s.ts IS NOT NULL AND s.dur IS NOT NULL")
+    for sid, core_id, group, nid, name, pid, ts, dur, code_id in cur.execute(sql):
+        item = (sid, nid, pid, ts, dur, code_id, name)
+        if _is_wait_name(name):
+            waits.append((core_id, group, *item))
+        elif _is_producer_name(name):
+            producers[(core_id, group)].append(item)
+
+    producer_pipe_ids = {p[2] for rows in producers.values() for p in rows}
+    work_by_pipe = defaultdict(list)
+    if producer_pipe_ids:
+        marks = ",".join("?" for _ in producer_pipe_ids)
+        for core_id, pipe_id, ts, dur, eid, code_id in cur.execute(
+                "SELECT core_id,pipe_id,ts,dur,id,code_id FROM events "
+                "WHERE ph='X' AND dur IS NOT NULL AND ts IS NOT NULL "
+                "AND pipe_id IN (" + marks + ") ORDER BY core_id,pipe_id,ts",
+                tuple(producer_pipe_ids)):
+            work_by_pipe[(core_id, pipe_id)].append(
+                (ts, ts + (dur or 0.0), eid, code_id))
+
+    pipe_names = dict(cur.execute("SELECT id,name FROM pipes"))
+    rows = []
+    stats = Counter()
+    for core_id, group, sid, nid, pid, ts, dur, code_id, name in waits:
+        cands = producers.get((core_id, group)) or []
+        best = None
+        status = "unknown_no_producer"
+        if cands:
+            before = [p for p in cands if p[3] + p[4] <= ts + dur + WAIT_MATCH_TOL_US]
+            if before:
+                best = max(before, key=lambda p: (p[3] + p[4], p[3]))
+            else:
+                best = min(cands, key=lambda p: (p[3], p[4]))
+        delay = None
+        slack = None
+        prod_span = prod_event = prod_pipe = prod_name = prod_code = None
+        prod_ts = prod_end = None
+        if best is not None:
+            prod_span, prod_nid, prod_pipe, flag_ts, flag_dur, flag_code, _ = best
+            prod_name = prod_nid
+            prod_code = flag_code
+            prod_ts = flag_ts
+            prod_end = flag_ts + (flag_dur or 0.0)
+            work = _preceding_work(work_by_pipe.get((core_id, prod_pipe), []),
+                                   flag_ts)
+            if work is not None:
+                prod_event = work[2]
+                prod_ts, prod_end, _, prod_code = work
+                if prod_code is None:
+                    prod_code = flag_code
+            wait_end = ts + (dur or 0.0)
+            if prod_end < ts - WAIT_MATCH_TOL_US:
+                status = "flag_already_set"
+                delay = 0.0
+                slack = ts - prod_end
+            elif prod_end <= wait_end + WAIT_MATCH_TOL_US:
+                status = "blocked_on_producer"
+                delay = max(0.0, min(wait_end, prod_end) - ts)
+                slack = wait_end - prod_end
+            else:
+                status = "producer_after_wait"
+                delay = None
+                slack = wait_end - prod_end
+        stats[status] += 1
+        prod_pipe_name = pipe_names.get(prod_pipe) if prod_pipe is not None else None
+        blocks = 1 if prod_pipe_name in DMA_PIPES else 0
+        rows.append((sid, core_id, pid, nid, code_id, ts, dur,
+                     prod_span, prod_event, prod_pipe, prod_name, prod_code,
+                     prod_ts, prod_end, delay, slack, status, blocks))
+
+    cur.executemany(
+        "INSERT INTO wait_attribution(span_id,core_id,consumer_pipe_id,"
+        "consumer_name_id,consumer_code_id,wait_ts,wait_dur,producer_span_id,"
+        "producer_event_id,producer_pipe_id,producer_name_id,producer_code_id,"
+        "producer_ts,producer_end_ts,delay_us,slack_us,status,blocks_on_dma)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.commit()
+    return rows
+
+def analyze_pipe_gaps(db, ctx, gap_us, top_peers=3):
+    """Find idle gaps per core+pipe and attribute them to waiting consumers."""
+    cur = db.cursor()
+    segments = defaultdict(list)
+    for core_id, pipe_id, ts, dur, first_id, last_id in cur.execute(
+            "SELECT core_id,pipe_id,ts,dur,first_event_id,last_event_id "
+            "FROM pipe_segments ORDER BY core_id,pipe_id,ts"):
+        segments[(core_id, pipe_id)].append((ts, ts + dur, first_id, last_id))
+
+    pipe_names = dict(cur.execute("SELECT id,name FROM pipes"))
+    core_bounds = {}
+    for core_id, lo, hi in cur.execute(
+            "SELECT core_id,MIN(ts),MAX(ts+dur) FROM events "
+            "WHERE ph='X' AND ts IS NOT NULL AND dur IS NOT NULL "
+            "GROUP BY core_id"):
+        core_bounds[core_id] = (lo, hi)
+
+    # All activity per core, used to report which other pipes ran during a gap.
+    by_core = defaultdict(lambda: defaultdict(list))
+    for (core_id, pipe_id), segs in segments.items():
+        by_core[core_id][pipe_id] = segs
+
+    waits_by_pipe = defaultdict(list)
+    for wid, core_id, prod_pipe, ts, dur in cur.execute(
+            "SELECT id,core_id,producer_pipe_id,wait_ts,wait_dur "
+            "FROM wait_attribution WHERE producer_pipe_id IS NOT NULL "
+            "AND COALESCE(delay_us,0) > 0"):
+        waits_by_pipe[(core_id, prod_pipe)].append(
+            (ts, ts + (dur or 0.0), wid))
+
+    rows = []
+    wait_gap_updates = []
+    for (core_id, pipe_id), segs in sorted(segments.items()):
+        lo, hi = core_bounds.get(core_id, (None, None))
+        if lo is None:
+            continue
+        # Only internal gaps between two activity segments.  Leading idle
+        # before the first transfer and trailing idle after the last one are
+        # not pipeline stalls, and reporting them as such is misleading.
+        gaps = []
+        for a, b in zip(segs, segs[1:]):
+            if b[0] > a[1]:
+                gaps.append((a[1], b[0], a[3], b[2]))
+
+        for start, end, before_id, after_id in gaps:
+            dur = end - start
+            if dur + 1e-9 < gap_us:
+                continue
+            peer = []
+            for other_pid, other_segs in by_core[core_id].items():
+                if other_pid == pipe_id:
+                    continue
+                ov = _overlap_merged(other_segs, start, end)
+                if ov > 0:
+                    peer.append((ov, pipe_names.get(other_pid, "")))
+            peer.sort(reverse=True)
+            peers = "; ".join(f"{name}:{ov:.4f}" for ov, name in peer[:top_peers])
+
+            related = waits_by_pipe.get((core_id, pipe_id), [])
+            intervals = []
+            for w in related:
+                lo2, hi2 = max(start, w[0]), min(end, w[1])
+                if hi2 > lo2:
+                    intervals.append((lo2, hi2))
+                    wait_gap_updates.append(w[2])
+            attributed = _union_overlaps(intervals, start, end)
+            status = "attributed" if attributed > 0 else "unknown_unattributed"
+            rows.append((core_id, pipe_id, start, dur, before_id, after_id,
+                         start, end, attributed, max(0.0, dur - attributed),
+                         len(intervals), status, peers))
+
+    cur.executemany(
+        "INSERT INTO pipe_gaps(core_id,pipe_id,ts,dur,before_event_id,"
+        "after_event_id,prev_end_ts,next_start_ts,attributed_us,"
+        "unattributed_us,attributed_waits,status,peers)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.commit()
+
+    # Attach each wait to the gap it overlaps (gaps of one pipe are disjoint).
+    if wait_gap_updates:
+        cur.executemany(
+            "UPDATE wait_attribution SET gap_id=("
+            "SELECT g.id FROM pipe_gaps g WHERE g.core_id=wait_attribution.core_id "
+            "AND g.pipe_id=wait_attribution.producer_pipe_id "
+            "AND wait_attribution.wait_ts < g.ts+g.dur "
+            "AND wait_attribution.wait_ts+wait_attribution.wait_dur > g.ts "
+            "LIMIT 1) WHERE id=?", [(wid,) for wid in wait_gap_updates])
+        db.commit()
+    return len(rows)
+
+
+_BYTES_RE = re.compile(
+    r"(?:^|[,;\s])(?:BYTES?|SIZE|LEN|LENGTH|NBYTES|BLOCK_BYTES)\s*[:=]\s*(\d+)",
+    re.I)
+_SRC_DST_RE = re.compile(r"Src\s*:\s*([A-Za-z0-9_]+)\s*,\s*Dst\s*:\s*([A-Za-z0-9_]+)",
+                         re.I)
+_ADDR_RE = re.compile(
+    r"\b(XN|XD|XM)\s*:\s*X\d+\s*=\s*(0x[0-9a-fA-F]+)", re.I)
+
+
+def _parse_detail_bytes(detail):
+    m = _BYTES_RE.search(detail or "")
+    return float(m.group(1)) if m else None
+
+
+def _parse_direction(detail, pipe):
+    m = _SRC_DST_RE.search(detail or "")
+    if m:
+        return f"{m.group(1).upper()}->{m.group(2).upper()}"
+    return DMA_DIRECTIONS.get(pipe, "UNKNOWN")
+
+
+def _buffer_key(detail):
+    s = re.sub(r"0x[0-9a-fA-F]+", "<hex>", detail or "")
+    s = re.sub(r"\bid\s*:\s*\d+", "id:<n>", s)
+    s = re.sub(r"\s+", "", s)
+    return s or "<empty>"
+
+
+def _parse_addr_value(detail):
+    found = {}
+    for m in _ADDR_RE.finditer(detail or ""):
+        found.setdefault(m.group(1).upper(), int(m.group(2), 16))
+    for key in ("XN", "XD", "XM"):
+        if key in found:
+            return found[key]
+    return None
+
+
+def analyze_dma(db):
+    """Estimate DMA bytes per event from static Process Bytes and detail text."""
+    cur = db.cursor()
+    pipe_ids = {}
+    for pid, name in cur.execute("SELECT id,name FROM pipes"):
+        if name in DMA_PIPES:
+            pipe_ids[pid] = name
+    if not pipe_ids:
+        return 0
+
+    # Non-DMA activity, merged per core, for overlap accounting.
+    non_dma = defaultdict(list)
+    pipe_names = dict(cur.execute("SELECT id,name FROM pipes"))
+    for core_id, pipe_id, ts, end in cur.execute(
+            "SELECT core_id,pipe_id,ts,ts+dur FROM events "
+            "WHERE ph='X' AND ts IS NOT NULL AND dur IS NOT NULL AND dur>=0"):
+        if pipe_id not in pipe_ids and pipe_names.get(pipe_id) not in MARKER_PIPES:
+            non_dma[core_id].append((ts, end, 0))
+    merged_non_dma = {cid: _merge_activity(sorted(rows))
+                      for cid, rows in non_dma.items()}
+
+    marks = ",".join("?" for _ in pipe_ids)
+    sql = (
+        "SELECT e.id,e.ts,e.dur,e.core_id,e.pipe_id,p.name,"
+        "e.name_id,e.code_id,e.detail_id,e.pc_id,COALESCE(pc.addr,''),"
+        "COALESCE(i.mnemonic,''),COALESCE(ic.calls,0),"
+        "COALESCE(ic.process_bytes,-1),COALESCE(cs.inner_file,''),"
+        "cs.inner_line,COALESCE(cs.outer_file,''),cs.outer_line,"
+        "COALESCE(dt.detail,'') "
+        "FROM events e JOIN pipes p ON p.id=e.pipe_id "
+        "LEFT JOIN pcs pc ON pc.id=e.pc_id "
+        "LEFT JOIN instructions i ON i.addr=pc.addr "
+        "LEFT JOIN instruction_core ic ON ic.addr=pc.addr "
+        "AND ic.core_id=e.core_id "
+        "LEFT JOIN code_stacks cs ON cs.id=e.code_id "
+        "LEFT JOIN details dt ON dt.id=e.detail_id "
+        "WHERE e.ph='X' AND p.name IN (" + marks + ") "
+        "ORDER BY e.ts,e.id")
+    rows = list(cur.execute(sql, tuple(pipe_ids.values())))
+    if not rows:
+        return 0
+
+    parsed = []
+    dup_count = Counter()
+    repeat_index = Counter()
+    prev_addr = {}
+    for r in rows:
+        (eid, ts, dur, core_id, pipe_id, pipe, nid, code_id, did, pcid,
+         addr, mnemonic, calls, proc_bytes, inner_file, inner_line,
+         outer_file, outer_line, detail) = r
+        explicit = _parse_detail_bytes(detail)
+        block = explicit
+        source = "detail"
+        if block is None:
+            if calls and calls > 0 and proc_bytes is not None and proc_bytes >= 0:
+                block = float(proc_bytes) / float(calls)
+                source = "instruction_process_bytes"
+            else:
+                source = "unknown"
+        bkey = _buffer_key(detail)
+        dup_key = (addr, re.sub(r"\bid\s*:\s*\d+", "id:<n>", detail or ""))
+        dup_count[dup_key] += 1
+        rk = (addr, bkey)
+        repeat_index[rk] += 1
+        val = _parse_addr_value(detail)
+        stride = None
+        if val is not None and addr in prev_addr:
+            stride = val - prev_addr[addr]
+        if val is not None:
+            prev_addr[addr] = val
+        overlap = _overlap_merged(merged_non_dma.get(core_id, []), ts, ts + (dur or 0.0))
+        parsed.append({
+            "event_id": eid, "ts": ts, "dur": dur or 0.0,
+            "core_id": core_id, "pipe_id": pipe_id, "pipe": pipe,
+            "direction": _parse_direction(detail, pipe),
+            "name_id": nid, "code_id": code_id, "detail_id": did,
+            "pc_id": pcid, "addr": addr, "mnemonic": mnemonic,
+            "file": inner_file or None, "line": inner_line,
+            "outer_file": outer_file or None, "outer_line": outer_line,
+            "block_bytes": block, "bytes_source": source,
+            "buffer_key": bkey, "duplicate_key": f"{addr}|{dup_key[1]}",
+            "repeat_index": repeat_index[rk], "dup_key": dup_key,
+            "stride_bytes": stride, "overlap_us": overlap,
+        })
+
+    name_map = dict(cur.execute("SELECT id,name FROM names"))
+    out = []
+    for p in parsed:
+        n = dup_count[p["dup_key"]]
+        name = name_map.get(p["name_id"], "")
+        if "PAD" in name.upper() or "PAD" in (p["buffer_key"] or "").upper():
+            cls = "padding_candidate"
+        elif n > 1:
+            cls = "duplicate_candidate"
+        else:
+            cls = "unclassified"
+        out.append((
+            p["event_id"], p["ts"], p["dur"], p["core_id"], p["pipe_id"],
+            p["direction"], p["name_id"], p["code_id"], p["detail_id"],
+            p["pc_id"], p["addr"], p["file"], p["line"], p["outer_file"],
+            p["outer_line"], p["mnemonic"], p["block_bytes"],
+            p["bytes_source"], p["buffer_key"], p["duplicate_key"],
+            p["repeat_index"], n, cls, p["stride_bytes"], p["overlap_us"]))
+
+    cur.executemany(
+        "INSERT INTO dma_events(event_id,ts,dur,core_id,pipe_id,direction,"
+        "name_id,code_id,detail_id,pc_id,addr,file,line,outer_file,"
+        "outer_line,mnemonic,block_bytes,bytes_source,buffer_key,"
+        "duplicate_key,repeat_index,duplicate_count,classification,"
+        "stride_bytes,overlap_us)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", out)
+    db.commit()
+    return len(out)
+
+
+def analyze_workload(db, ctx, gap_us):
+    _insert_pipe_segments(db, _load_pipe_segments(db))
+    analyze_wait_attribution(db)
+    analyze_pipe_gaps(db, ctx, gap_us)
+    analyze_dma(db)
 
 
 # --------------------------------------------------------------------------
@@ -967,14 +1738,141 @@ def export_csvs(db, out_dir, ctx, want_events=True, top_n=30,
                           "ORDER BY h.bucket_start_us, h.pipe_id").fetchall())
 
     write_csv(os.path.join(d, "spans.csv"),
-              ["id", "core", "group_id", "name", "pipe", "ts", "dur"],
+              ["id", "core", "group_id", "name", "pipe", "ts", "dur",
+               "b_event_id", "e_event_id", "code_id"],
               cur.execute("SELECT s.id, COALESCE(c.name,''), s.group_id, "
                           "COALESCE(n.name,''), COALESCE(p.name,''), "
-                          "s.ts, s.dur FROM spans s "
+                          "s.ts, s.dur, s.b_event_id, s.e_event_id, s.code_id "
+                          "FROM spans s "
                           "LEFT JOIN cores c ON c.id=s.core_id "
                           "LEFT JOIN names n ON n.id=s.name_id "
                           "LEFT JOIN pipes p ON p.id=s.pipe_id "
                           "ORDER BY s.dur DESC").fetchall())
+
+    write_csv(os.path.join(d, "pipe_segments.csv"),
+              ["core", "pipe", "ts", "dur", "n_events",
+               "first_event_id", "last_event_id"],
+              cur.execute("SELECT COALESCE(c.name,''), COALESCE(p.name,''), "
+                          "s.ts, s.dur, s.n_events, s.first_event_id, "
+                          "s.last_event_id FROM pipe_segments s "
+                          "LEFT JOIN cores c ON c.id=s.core_id "
+                          "LEFT JOIN pipes p ON p.id=s.pipe_id "
+                          "ORDER BY s.core_id, s.pipe_id, s.ts").fetchall())
+
+    write_csv(os.path.join(d, "pipe_activity.csv"),
+              ["core", "pipe", "segments", "active_us", "first_ts", "last_ts",
+               "gap_count", "gap_us", "attributed_gap_us",
+               "unattributed_gap_us"],
+              cur.execute("SELECT core, pipe, segments, active_us, first_ts, "
+                          "last_ts, gap_count, gap_us, attributed_gap_us, "
+                          "unattributed_gap_us FROM v_pipe_activity "
+                          "ORDER BY gap_us DESC").fetchall())
+
+    write_csv(os.path.join(d, "pipe_gaps.csv"),
+              ["id", "core", "pipe", "ts", "dur", "before_name", "after_name",
+               "before_file", "before_line", "after_file", "after_line",
+               "attributed_us", "unattributed_us", "attributed_waits",
+               "status", "peers"],
+              cur.execute("SELECT id, core, pipe, ts, dur, before_name, "
+                          "after_name, before_file, before_line, after_file, "
+                          "after_line, attributed_us, unattributed_us, "
+                          "attributed_waits, status, peers FROM v_pipe_gap "
+                          "ORDER BY dur DESC").fetchall())
+
+    write_csv(os.path.join(d, "wait_attribution.csv"),
+              ["id", "core", "consumer_pipe", "consumer_name",
+               "consumer_inner_file", "consumer_inner_line",
+               "consumer_outer_file", "consumer_outer_line",
+               "wait_ts", "wait_dur", "producer_pipe", "producer_name",
+               "producer_event_id", "producer_inner_file", "producer_inner_line",
+               "producer_outer_file", "producer_outer_line",
+               "producer_end_ts", "delay_us", "slack_us", "status",
+               "blocks_on_dma", "gap_id"],
+              cur.execute("SELECT id, core, consumer_pipe, consumer_name, "
+                          "consumer_inner_file, consumer_inner_line, "
+                          "consumer_outer_file, consumer_outer_line, wait_ts, "
+                          "wait_dur, producer_pipe, producer_name, "
+                          "producer_event_id, producer_inner_file, "
+                          "producer_inner_line, "
+                          "producer_outer_file, producer_outer_line, "
+                          "producer_end_ts, delay_us, slack_us, status, "
+                          "blocks_on_dma, gap_id FROM v_wait_attribution "
+                          "ORDER BY wait_dur DESC").fetchall())
+
+    write_csv(os.path.join(d, "dma_by_source.csv"),
+              ["file", "line", "pipe", "direction", "events", "bytes_inferred",
+               "events_without_bytes", "overlap_us", "duplicate_events",
+               "min_block_bytes", "max_block_bytes", "buffers"],
+              cur.execute("SELECT file, line, pipe, direction, events, "
+                          "bytes_inferred, events_without_bytes, overlap_us, "
+                          "duplicate_events, min_block_bytes, max_block_bytes, "
+                          "buffers FROM v_dma_source "
+                          "ORDER BY bytes_inferred DESC").fetchall())
+
+    write_csv(os.path.join(d, "dma_by_kernel_source.csv"),
+              ["file", "line", "pipe", "direction", "events", "bytes_inferred",
+               "events_without_bytes", "overlap_us", "duplicate_events"],
+              cur.execute("SELECT file, line, pipe, direction, events, "
+                          "bytes_inferred, events_without_bytes, overlap_us, "
+                          "duplicate_events FROM v_dma_kernel_source "
+                          "ORDER BY bytes_inferred DESC").fetchall())
+
+    write_csv(os.path.join(d, "dma_by_buffer.csv"),
+              ["addr", "buffer_key", "pipe", "direction", "file", "line",
+               "outer_file", "outer_line", "events", "bytes_inferred",
+               "min_block_bytes", "max_block_bytes", "min_stride_bytes",
+               "max_stride_bytes", "duplicate_events"],
+              cur.execute("SELECT addr, buffer_key, pipe, direction, file, "
+                          "line, outer_file, outer_line, events, "
+                          "bytes_inferred, min_block_bytes, max_block_bytes, "
+                          "min_stride_bytes, max_stride_bytes, "
+                          "duplicate_events FROM v_dma_buffer "
+                          "ORDER BY bytes_inferred DESC").fetchall())
+
+    write_csv(os.path.join(d, "dma_by_instruction.csv"),
+              ["addr", "mnemonic", "pipe", "direction", "file", "line",
+               "outer_file", "outer_line", "events", "bytes_inferred",
+               "min_block_bytes", "max_block_bytes", "overlap_us",
+               "duplicate_events"],
+              cur.execute("SELECT addr, mnemonic, pipe, direction, file, line, "
+                          "outer_file, outer_line, events, bytes_inferred, "
+                          "min_block_bytes, max_block_bytes, overlap_us, "
+                          "duplicate_events FROM v_dma_instruction "
+                          "ORDER BY bytes_inferred DESC").fetchall())
+
+    write_csv(os.path.join(d, "dma_duplicates.csv"),
+              ["addr", "buffer_key", "duplicate_key", "pipe", "direction",
+               "file", "line", "outer_file", "outer_line", "events",
+               "block_bytes", "bytes_inferred", "first_ts", "last_ts"],
+              cur.execute("SELECT addr, buffer_key, duplicate_key, pipe, "
+                          "direction, file, line, outer_file, outer_line, "
+                          "events, block_bytes, bytes_inferred, first_ts, "
+                          "last_ts FROM v_dma_duplicate "
+                          "ORDER BY bytes_inferred DESC").fetchall())
+
+    with open(os.path.join(d, "dma_events.csv"), "w", newline="",
+              encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["event_id", "ts", "dur", "core", "pipe", "direction",
+                    "name", "addr", "mnemonic", "file", "line", "outer_file",
+                    "outer_line", "block_bytes", "bytes_source", "buffer_key",
+                    "duplicate_key", "repeat_index", "duplicate_count",
+                    "classification", "stride_bytes", "overlap_us", "detail"])
+        for row in cur.execute(
+                "SELECT d.event_id, d.ts, d.dur, COALESCE(c.name,''), "
+                "COALESCE(p.name,''), d.direction, COALESCE(n.name,''), "
+                "d.addr, d.mnemonic, d.file, d.line, d.outer_file, "
+                "d.outer_line, d.block_bytes, d.bytes_source, d.buffer_key, "
+                "d.duplicate_key, d.repeat_index, d.duplicate_count, "
+                "d.classification, d.stride_bytes, d.overlap_us, "
+                "COALESCE(dt.detail,'') "
+                "FROM dma_events d "
+                "LEFT JOIN cores c ON c.id=d.core_id "
+                "LEFT JOIN pipes p ON p.id=d.pipe_id "
+                "LEFT JOIN names n ON n.id=d.name_id "
+                "LEFT JOIN details dt ON dt.id=d.detail_id "
+                "ORDER BY d.ts, d.event_id"):
+            w.writerow(row)
 
     # instruction_core is large: stream it
     with open(os.path.join(d, "instruction_core.csv"), "w", newline="",
@@ -1096,6 +1994,83 @@ def build_summary(db, out_dir, ctx, meta):
         "SELECT n.name,c.name,s.ts,s.dur,s.group_id "
         "FROM spans s JOIN names n ON n.id=s.name_id "
         "JOIN cores c ON c.id=s.core_id ORDER BY s.dur DESC LIMIT 20")
+    pipe_activity = rows(
+        "SELECT core,pipe,segments,active_us,gap_count,gap_us,"
+        "attributed_gap_us,unattributed_gap_us FROM v_pipe_activity "
+        "ORDER BY gap_us DESC")
+    top_gaps = rows(
+        "SELECT id,core,pipe,ts,dur,before_name,after_name,before_file,"
+        "before_line,after_file,after_line,attributed_us,unattributed_us,"
+        "attributed_waits,status,peers FROM v_pipe_gap "
+        "ORDER BY dur DESC LIMIT ?", (top_n,))
+    wait_status = rows(
+        "SELECT status,COUNT(*),SUM(wait_dur),SUM(COALESCE(delay_us,0)) "
+        "FROM wait_attribution GROUP BY status ORDER BY COUNT(*) DESC")
+    wait_by_producer = rows(
+        "SELECT COALESCE(pp.name,''),COUNT(*),SUM(w.wait_dur),"
+        "SUM(COALESCE(w.delay_us,0)),SUM(w.blocks_on_dma) "
+        "FROM wait_attribution w LEFT JOIN pipes pp ON pp.id=w.producer_pipe_id "
+        "GROUP BY w.producer_pipe_id ORDER BY SUM(COALESCE(w.delay_us,0)) DESC")
+    wait_consumers = rows(
+        "SELECT consumer_outer_file,consumer_outer_line,consumer_inner_file,"
+        "consumer_inner_line,COUNT(*),SUM(wait_dur),"
+        "SUM(COALESCE(delay_us,0)) FROM v_wait_attribution "
+        "WHERE delay_us IS NOT NULL "
+        "GROUP BY consumer_outer_file,consumer_outer_line,"
+        "consumer_inner_file,consumer_inner_line "
+        "ORDER BY SUM(COALESCE(delay_us,0)) DESC LIMIT ?", (top_n,))
+    top_waits = rows(
+        "SELECT core,consumer_pipe,consumer_inner_file,consumer_inner_line,"
+        "consumer_outer_file,consumer_outer_line,wait_ts,wait_dur,"
+        "producer_pipe,producer_inner_file,producer_inner_line,"
+        "producer_outer_file,producer_outer_line,producer_end_ts,delay_us,"
+        "slack_us,status,blocks_on_dma,gap_id FROM v_wait_attribution "
+        "WHERE delay_us IS NOT NULL ORDER BY delay_us DESC LIMIT ?", (top_n,))
+    dma_by_pipe = rows(
+        "SELECT p.name,d.direction,COUNT(*),"
+        "SUM(COALESCE(d.block_bytes,0)),"
+        "SUM(CASE WHEN d.block_bytes IS NULL THEN 1 ELSE 0 END),"
+        "SUM(COALESCE(d.overlap_us,0)),"
+        "SUM(CASE WHEN d.classification='duplicate_candidate' THEN 1 ELSE 0 END) "
+        "FROM dma_events d JOIN pipes p ON p.id=d.pipe_id "
+        "GROUP BY d.pipe_id,d.direction ORDER BY 4 DESC")
+    dma_by_instruction = rows(
+        "SELECT addr,mnemonic,pipe,direction,file,line,outer_file,outer_line,"
+        "events,bytes_inferred,min_block_bytes,max_block_bytes,overlap_us,"
+        "duplicate_events FROM v_dma_instruction "
+        "ORDER BY bytes_inferred DESC LIMIT ?", (top_n,))
+    dma_by_kernel = rows(
+        "SELECT file,line,pipe,direction,events,bytes_inferred,"
+        "events_without_bytes,overlap_us,duplicate_events "
+        "FROM v_dma_kernel_source ORDER BY bytes_inferred DESC LIMIT ?",
+        (top_n,))
+    dma_dups = rows(
+        "SELECT addr,buffer_key,pipe,direction,file,line,outer_file,outer_line,"
+        "events,block_bytes,bytes_inferred,first_ts,last_ts "
+        "FROM v_dma_duplicate ORDER BY bytes_inferred DESC LIMIT ?", (top_n,))
+    dma_totals = rows(
+        "SELECT COUNT(*),SUM(COALESCE(block_bytes,0)),"
+        "SUM(CASE WHEN block_bytes IS NULL THEN 1 ELSE 0 END),"
+        "SUM(COALESCE(overlap_us,0)),"
+        "COALESCE((SELECT SUM(cnt-1) FROM (SELECT COUNT(*) cnt "
+        "FROM dma_events WHERE duplicate_count>1 GROUP BY duplicate_key)),0),"
+        "COALESCE((SELECT SUM((cnt-1)*block) FROM (SELECT COUNT(*) cnt, "
+        "MIN(block_bytes) block FROM dma_events WHERE duplicate_count>1 "
+        "GROUP BY duplicate_key)),0),"
+        "SUM(CASE WHEN classification='duplicate_candidate' THEN 1 ELSE 0 END) "
+        "FROM dma_events")[0]
+    gap_totals = rows(
+        "SELECT COUNT(*),SUM(dur),SUM(attributed_us),SUM(unattributed_us) "
+        "FROM pipe_gaps")[0]
+    dma_gap_totals = rows(
+        "SELECT COUNT(*),SUM(g.dur),SUM(g.attributed_us),"
+        "SUM(g.unattributed_us) FROM pipe_gaps g JOIN pipes p ON p.id=g.pipe_id "
+        "WHERE p.name IN ('MTE2','MTE3')")[0]
+    wait_totals = rows(
+        "SELECT COUNT(*),SUM(wait_dur),SUM(COALESCE(delay_us,0)),"
+        "SUM(CASE WHEN blocks_on_dma=1 THEN COALESCE(delay_us,0) ELSE 0 END),"
+        "SUM(CASE WHEN delay_us IS NULL THEN 1 ELSE 0 END) "
+        "FROM wait_attribution")[0]
     ph_counts = ctx.ph_counts
     n_cores = len(cores)
     n_events = ctx.event_count
@@ -1171,6 +2146,18 @@ def build_summary(db, out_dir, ctx, meta):
         if spread > 1.05:
             warnings.append(f"Accumulated instruction-latency imbalance: max/min per-core SUM(dur) "
                             f"= {spread:.3f}; not execution-time imbalance.")
+    if wait_totals[4]:
+        warnings.append(f"{wait_totals[4]:,} WAIT spans have no matching producer or an "
+                        "unresolved producer order; their delay is reported as unknown (NULL), not zero.")
+    if dma_totals[2]:
+        warnings.append(f"{dma_totals[2]:,} of {dma_totals[0]:,} DMA events have no byte estimate; "
+                        "sums are lower bounds and `device_measured_bytes` stays null.")
+    if dma_totals[6]:
+        warnings.append(f"{dma_totals[6]:,} DMA events are duplicate candidates (same PC and normalized "
+                        "detail). This is a heuristic, not proof that the data was useless or avoidable.")
+    if gap_totals[0]:
+        warnings.append(f"{gap_totals[3] or 0:.2f} us of pipe idle gaps are unattributed; "
+                        "they are unknown, not proven harmless or proven blocking.")
 
     if (not instruction_rows or (instruction_rows and accounted != total_calls)
             or unmatched_begins or ctx.unmatched_ends or ctx.invalid_spans or ctx.invalid_times or missing_source):
@@ -1250,6 +2237,103 @@ def build_summary(db, out_dir, ctx, meta):
                  "dur_max": r[3]} for r in span_stats
             ],
         },
+        "pipe_activity": [
+            {"core": r[0], "pipe": r[1], "segments": r[2],
+             "active_us": r[3], "gap_count": r[4], "gap_us": r[5],
+             "attributed_gap_us": r[6],
+             "unattributed_gap_us": r[7]} for r in pipe_activity
+        ],
+        "pipe_gaps": {
+            "threshold_us": meta.get("gap_us"),
+            "count": gap_totals[0] or 0,
+            "gap_us": gap_totals[1] or 0.0,
+            "attributed_us": gap_totals[2] or 0.0,
+            "unattributed_us": gap_totals[3] or 0.0,
+            "dma_gap_count": dma_gap_totals[0] or 0,
+            "dma_gap_us": dma_gap_totals[1] or 0.0,
+            "dma_attributed_us": dma_gap_totals[2] or 0.0,
+            "dma_unattributed_us": dma_gap_totals[3] or 0.0,
+            "top": [
+                {"id": r[0], "core": r[1], "pipe": r[2], "ts": r[3],
+                 "dur_us": r[4], "before_name": r[5], "after_name": r[6],
+                 "before_file": r[7], "before_line": r[8],
+                 "after_file": r[9], "after_line": r[10],
+                 "attributed_us": r[11], "unattributed_us": r[12],
+                 "attributed_waits": r[13], "status": r[14],
+                 "peers": r[15]} for r in top_gaps
+            ],
+        },
+        "waits": {
+            "count": wait_totals[0] or 0,
+            "wait_us": wait_totals[1] or 0.0,
+            "attributed_delay_us": wait_totals[2] or 0.0,
+            "dma_delay_us": wait_totals[3] or 0.0,
+            "unattributed_count": wait_totals[4] or 0,
+            "by_status": [
+                {"status": r[0], "count": r[1], "wait_us": r[2],
+                 "delay_us": r[3]} for r in wait_status
+            ],
+            "by_producer_pipe": [
+                {"pipe": r[0], "count": r[1], "wait_us": r[2],
+                 "delay_us": r[3], "on_dma": r[4]} for r in wait_by_producer
+            ],
+            "by_consumer_source": [
+                {"outer_file": r[0], "outer_line": r[1],
+                 "inner_file": r[2], "inner_line": r[3], "count": r[4],
+                 "wait_us": r[5], "delay_us": r[6]} for r in wait_consumers
+            ],
+            "top": [
+                {"core": r[0], "consumer_pipe": r[1],
+                 "consumer_inner_file": r[2], "consumer_inner_line": r[3],
+                 "consumer_outer_file": r[4], "consumer_outer_line": r[5],
+                 "wait_ts": r[6], "wait_us": r[7], "producer_pipe": r[8],
+                 "producer_inner_file": r[9], "producer_inner_line": r[10],
+                 "producer_outer_file": r[11], "producer_outer_line": r[12],
+                 "producer_end_ts": r[13], "delay_us": r[14],
+                 "slack_us": r[15], "status": r[16],
+                 "blocks_on_dma": r[17], "gap_id": r[18]} for r in top_waits
+            ],
+        },
+        "dma": {
+            "pipes": list(DMA_PIPES),
+            "events": dma_totals[0] or 0,
+            "bytes_inferred": dma_totals[1] or 0.0,
+            "events_without_bytes": dma_totals[2] or 0,
+            "overlap_us": dma_totals[3] or 0.0,
+            "duplicate_excess_events": dma_totals[4] or 0,
+            "duplicate_excess_bytes": dma_totals[5] or 0.0,
+            "duplicate_candidate_events": dma_totals[6] or 0,
+            "device_measured_bytes": None,
+            "bytes_source": "instruction Process Bytes / detail text; estimated, not measured traffic",
+            "by_pipe": [
+                {"pipe": r[0], "direction": r[1], "events": r[2],
+                 "bytes_inferred": r[3], "events_without_bytes": r[4],
+                 "overlap_us": r[5], "duplicate_events": r[6]}
+                for r in dma_by_pipe
+            ],
+            "by_instruction": [
+                {"addr": r[0], "mnemonic": r[1], "pipe": r[2],
+                 "direction": r[3], "file": r[4], "line": r[5],
+                 "outer_file": r[6], "outer_line": r[7], "events": r[8],
+                 "bytes_inferred": r[9], "min_block_bytes": r[10],
+                 "max_block_bytes": r[11], "overlap_us": r[12],
+                 "duplicate_events": r[13]} for r in dma_by_instruction
+            ],
+            "by_kernel_source": [
+                {"file": r[0], "line": r[1], "pipe": r[2],
+                 "direction": r[3], "events": r[4],
+                 "bytes_inferred": r[5], "events_without_bytes": r[6],
+                 "overlap_us": r[7], "duplicate_events": r[8]}
+                for r in dma_by_kernel
+            ],
+            "duplicate_candidates": [
+                {"addr": r[0], "buffer_key": r[1], "pipe": r[2],
+                 "direction": r[3], "file": r[4], "line": r[5],
+                 "outer_file": r[6], "outer_line": r[7], "events": r[8],
+                 "block_bytes": r[9], "bytes_inferred": r[10],
+                 "first_ts": r[11], "last_ts": r[12]} for r in dma_dups
+            ],
+        },
         "warnings": warnings,
         "quality": quality,
         "metric_semantics": {
@@ -1260,6 +2344,14 @@ def build_summary(db, out_dir, ctx, meta):
             "share": "Share of accumulated instruction latency, not fraction of elapsed time.",
             "cycles": "Producer counter with unverified clock semantics; do not convert to microseconds.",
             "device_task_duration_us": "Unavailable from this simulator trace; null, never inferred.",
+            "pipe_gaps": "Simulator-timeline idle intervals per core+pipe, measured against X-event activity. A gap is not proof of a bottleneck.",
+            "gap_attributed_us": "Portion of a gap overlapped by consumer WAIT spans whose producer is the same pipe. Union of wait intervals, not additive with other gaps.",
+            "gap_unattributed_us": "Gap time not matched to a producer/consumer wait pair. Treat as unknown, not as free time.",
+            "wait_attribution": "WAIT_FLAG-like B/E spans paired by group_id with SET_FLAG-like producer spans. delay_us is the blocked portion inside the wait, not real-device time.",
+            "dma_bytes_inferred": "Per-event block size derived from static instruction Process Bytes / calls or an explicit detail field. Estimated traffic, not measured device bandwidth.",
+            "dma_duplicate_candidate": "Same instruction PC and same normalized detail (same addresses, id ignored) executed more than once. Candidate duplicate read, not proof.",
+            "dma_overlap_us": "Per-DMA-event intersection with merged non-DMA activity on the same core; sums can overlap across events.",
+            "device_measured_bytes": "Always null; no device traffic counter is available from this simulator input.",
         },
     }
 
@@ -1407,6 +2499,91 @@ def build_summary(db, out_dir, ctx, meta):
         add("_no B/E spans found_")
     add("")
 
+    def short_loc(f, line):
+        if not f:
+            return "-"
+        return f"{os.path.basename(f)}:{line if line is not None else '-'}"
+
+    add("## Pipe idle gaps (simulator timeline)\n")
+    add(f"Gaps are per core+pipe, relative to merged X-event activity; "
+        f"minimum reported gap = {meta.get('gap_us')} us. `attributed` means "
+        "the gap overlaps a consumer WAIT whose producer is the same pipe. "
+        "Unattributed time is **unknown**, not proven free.\n")
+    if pipe_activity:
+        add("| core | pipe | segments | active_us | gaps | gap_us | attributed_us | unattributed_us |")
+        add("|---|---|---:|---:|---:|---:|---:|---:|")
+        for r in pipe_activity[:top_n]:
+            add(f"| {r[0]} | {r[1]} | {r[2]:,} | {fmt_num(r[3])} | "
+                f"{r[4]:,} | {fmt_num(r[5], 4)} | {fmt_num(r[6], 4)} | "
+                f"{fmt_num(r[7], 4)} |")
+    else:
+        add("_no pipe activity found_")
+    add("")
+    if top_gaps:
+        add("Largest gaps:\n")
+        add("| core | pipe | ts | dur_us | before | after | attributed_us | status | peers |")
+        add("|---|---|---:|---:|---|---|---:|---|---|")
+        for r in top_gaps:
+            add(f"| {r[1]} | {r[2]} | {fmt_num(r[3], 4)} | {fmt_num(r[4], 4)} | "
+                f"{short_loc(r[7], r[8])} {r[5] or ''} | "
+                f"{short_loc(r[9], r[10])} {r[6] or ''} | "
+                f"{fmt_num(r[11], 4)} | {r[14]} | {r[15] or ''} |")
+        add("")
+
+    add("## Wait attribution (consumer blocked on producer)\n")
+    add("Pairing uses `group_id` shared by `WAIT_FLAG` / `SET_FLAG` B/E spans. "
+        "`delay_us` is the blocked portion inside the wait span; it is simulation "
+        "time, not device elapsed time.\n")
+    if wait_by_producer:
+        add("| producer pipe | waits | wait_us | delay_us | on DMA |")
+        add("|---|---:|---:|---:|---:|")
+        for r in wait_by_producer:
+            add(f"| {r[0] or '(unknown)'} | {r[1]:,} | {fmt_num(r[2])} | "
+                f"{fmt_num(r[3])} | {r[4]:,} |")
+        add("")
+    if top_waits:
+        add("Longest attributable waits:\n")
+        add("| core | consumer (kernel) | producer pipe | producer (kernel) | delay_us | status |")
+        add("|---|---|---|---|---:|---|")
+        for r in top_waits:
+            add(f"| {r[0]} | {short_loc(r[4], r[5])} `{r[2]}:{r[3]}` | "
+                f"{r[8] or '-'} | {short_loc(r[11], r[12])} | "
+                f"{fmt_num(r[14])} | {r[16]} |")
+        add("")
+    else:
+        add("_no attributable WAIT/SET pairs found_")
+        add("")
+
+    add("## DMA transfer estimates (instruction-derived)\n")
+    add("These bytes come from static instruction `Process Bytes` / calls or an "
+        "explicit `detail` field. They are **not** measured device traffic; "
+        "`device_measured_bytes` remains null. Effective vs padding vs duplicate "
+        "is a candidate classification, not proof.\n")
+    if dma_by_pipe:
+        add("| pipe | direction | events | bytes_inferred | unknown_bytes_events | overlap_us | duplicate_events |")
+        add("|---|---|---:|---:|---:|---:|---:|")
+        for r in dma_by_pipe:
+            add(f"| {r[0]} | {r[1]} | {r[2]:,} | {fmt_num(r[3])} | "
+                f"{r[4]:,} | {fmt_num(r[5])} | {r[6]:,} |")
+        add("")
+    if dma_by_kernel:
+        add("Top DMA kernel call sites (outermost frame):\n")
+        add("| file | line | pipe | direction | events | bytes_inferred | overlap_us | duplicate_events |")
+        add("|---|---:|---|---|---:|---:|---:|---:|")
+        for r in dma_by_kernel:
+            add(f"| {r[0]} | {r[1] if r[1] is not None else '-'} | {r[2]} | "
+                f"{r[3]} | {r[4]:,} | {fmt_num(r[5])} | {fmt_num(r[7])} | "
+                f"{r[8]:,} |")
+        add("")
+    if dma_dups:
+        add("Duplicate-read candidates (same PC + normalized detail):\n")
+        add("| instrument | addr | source | events | block_bytes | bytes_inferred |")
+        add("|---|---|---|---:|---:|---:|")
+        for r in dma_dups:
+            add(f"| {r[2]} | {r[0]} | {short_loc(r[6], r[7])} | {r[8]:,} | "
+                f"{fmt_num(r[9])} | {fmt_num(r[10])} |")
+        add("")
+
     if warnings:
         add("## Warnings / caveats\n")
         for w in warnings:
@@ -1434,14 +2611,28 @@ def build_summary(db, out_dir, ctx, meta):
                 "## Hotspot leads (not proven bottlenecks)", ""]
     for r in summary["top_mnemonics"][:3]:
         overview.append(f"- `{r['mnemonic']}`: {fmt_num(r['trace_dur_us'])} us accumulated latency.")
+    if summary["waits"]["top"]:
+        w = summary["waits"]["top"][0]
+        overview.append(
+            f"- top attributable wait: `{os.path.basename(w['consumer_outer_file'] or w['consumer_inner_file'] or '?')}:"
+            f"{w['consumer_outer_line'] or w['consumer_inner_line'] or '?'}` waited "
+            f"{fmt_num(w['delay_us'])} us on `{w['producer_pipe'] or '?'}` from "
+            f"`{os.path.basename(w['producer_outer_file'] or w['producer_inner_file'] or '?')}:"
+            f"{w['producer_outer_line'] or w['producer_inner_line'] or '?'}`.")
+    if summary["dma"]["events"]:
+        overview.append(
+            f"- DMA estimate: {default_human(summary['dma']['bytes_inferred'])} across "
+            f"{summary['dma']['events']:,} events; duplicate-candidate excess "
+            f"{default_human(summary['dma']['duplicate_excess_bytes'])} (estimated, not measured).")
     overview += ["", "## Data quality", ""] + [f"- {w}" for w in warnings[:5]]
     if len(warnings) > 5:
         overview.append("- More caveats in summary.md; full diagnostics in summary.json.")
     overview += ["", "## Next queries", "",
                  "1. Use queries.sql #5/#6 to connect hotspots to source and instructions.",
-                 "2. Use #7 to inspect a specific core/time window, and #8 for sync waits.",
-                 "3. Inspect quality.per_core_accounting before comparing counter-derived totals.",
-                 "4. Verify any optimization hypothesis with an independent device timing run.", ""]
+                 "2. Use #11/#12 to list pipe gaps and wait attribution by source line.",
+                 "3. Use #13/#14 to inspect DMA bytes, repeats and duplicate candidates.",
+                 "4. Use `perfp compare A B` to align two stages and optional device timings.",
+                 "5. Verify any optimization hypothesis with an independent device timing run.", ""]
     with open(os.path.join(out_dir, "overview.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(overview))
 
@@ -1628,6 +2819,38 @@ ORDER BY h.bucket_start_us, h.pipe_id;
 -- 10. Which source line does the hottest instruction belong to?
 SELECT addr, mnemonic, pipe, src, ROUND(trace_dur_us,2) AS trace_dur_us
 FROM v_instruction ORDER BY trace_dur_us DESC LIMIT 10;
+
+-- 11. Largest pipe idle gaps and whether a consumer waited on that pipe
+SELECT core, pipe, ROUND(ts,4) AS ts, ROUND(dur,4) AS dur_us,
+       before_name, after_name, attributed_us, attributed_waits, status, peers
+FROM v_pipe_gap ORDER BY dur DESC LIMIT 30;
+
+-- 12. Which consumer source line waited on which producer pipe/source?
+SELECT consumer_outer_file, consumer_outer_line, producer_pipe,
+       COUNT(*) AS waits, ROUND(SUM(wait_dur),4) AS wait_us,
+       ROUND(SUM(COALESCE(delay_us,0)),4) AS delay_us
+FROM v_wait_attribution GROUP BY 1,2,3
+ORDER BY delay_us DESC LIMIT 30;
+
+-- 13. DMA bytes per kernel source line (instruction-derived estimate)
+SELECT file, line, pipe, direction, events, bytes_inferred, overlap_us,
+       duplicate_events
+FROM v_dma_kernel_source ORDER BY bytes_inferred DESC LIMIT 30;
+
+-- 14. DMA duplicate-read candidates and their estimated excess bytes
+SELECT addr, pipe, file, line, events, block_bytes, bytes_inferred,
+       ROUND(bytes_inferred - block_bytes,1) AS excess_bytes
+FROM v_dma_duplicate ORDER BY bytes_inferred DESC LIMIT 30;
+
+-- 15. DMA buffer shapes / strides (same normalized detail, repeated)
+SELECT pipe, direction, addr, file, line, events, bytes_inferred,
+       min_block_bytes, max_block_bytes, min_stride_bytes, max_stride_bytes
+FROM v_dma_buffer ORDER BY bytes_inferred DESC LIMIT 30;
+
+-- 16. Per core+pipe active time vs idle gaps
+SELECT core, pipe, segments, active_us, gap_count, gap_us,
+       attributed_gap_us, unattributed_gap_us
+FROM v_pipe_activity ORDER BY gap_us DESC LIMIT 30;
 """
     with open(os.path.join(out_dir, "queries.sql"), "w", encoding="utf-8") as f:
         f.write(queries)
@@ -1644,7 +2867,8 @@ agent can answer performance questions without ever loading the 300 MB binary.
 
 1. `overview.md` -- short entry point: quality, hotspot leads and next queries.
 2. `summary.md`  -- full digest: trace shape, pipe/core balance, top
-   mnemonics, top source locations, sync spans, caveats.
+   mnemonics, top source locations, sync spans, pipe idle gaps, wait
+   attribution, DMA estimates and caveats.
 3. `profile.sqlite` -- the full, queryable dataset.  Prefer SQL over CSV.
 4. `csv/` -- exported tables for grep/awk.  `events.csv.gz` is the full event
    stream (dictionary encoded: `code_id` -> `csv/code_stacks.csv`).
@@ -1671,6 +2895,10 @@ agent can answer performance questions without ever loading the 300 MB binary.
 | `instruction_core` | ~90k | per instruction x per core counters |
 | `files` / `file_lines` | ~30 / ~600 | record 29 per-line statistics |
 | `timeline_hist` | small | histogram of events over time |
+| `pipe_segments` | per core+pipe | merged X-event activity intervals |
+| `pipe_gaps` | per core+pipe | idle gaps with attributed/unattributed time |
+| `wait_attribution` | per WAIT span | paired producer, delay and status |
+| `dma_events` | per MTE event | inferred block bytes, overlap, duplicate candidate |
 
 Convenience views:
 
@@ -1679,6 +2907,12 @@ Convenience views:
 - `v_code_line_core`-- same, per core
 - `v_exec_location` -- trace latency grouped by innermost stack frame
 - `v_kernel_location` -- trace latency grouped by outermost (user kernel) frame
+- `v_pipe_activity` -- per core+pipe active time, gap count and attributed gaps
+- `v_pipe_gap` -- gaps with before/after event and consumer wait attribution
+- `v_wait_attribution` -- WAIT/SET pairing, delay, slack and source lines
+- `v_dma_source` / `v_dma_kernel_source` -- DMA estimates by inner/kernel source
+- `v_dma_buffer` / `v_dma_instruction` -- DMA shape, stride and repeat accounting
+- `v_dma_duplicate` -- duplicate-read candidates (same PC + normalized detail)
 
 All `*_id` columns are small integers.  Join to `cores`, `pipes`, `names`,
 `code_stacks`, `details`, `pcs` for text.
@@ -1699,6 +2933,15 @@ All `*_id` columns are small integers.  Join to `cores`, `pipes`, `names`,
   core clock cycles and must not be converted to microseconds.  `perfp` emits a
   warning in `summary.md` when the implied frequency is implausible.
 - `spans.dur` is `E.ts - B.ts` on the simulator timeline, not real-device duration.
+- `pipe_gaps.attributed_us` is the union of consumer WAIT intervals blocked on the
+  same pipe. `unattributed_us` is **unknown**, not proven free time.
+- `wait_attribution.delay_us` is the blocked portion inside a WAIT span. It is
+  simulator time, not device elapsed time. WAIT/SET pairs are matched by
+  `group_id`; unresolved pairs keep `delay_us = NULL` and an explicit status.
+- `dma_events.block_bytes` is inferred from static instruction `Process Bytes`
+  divided by calls, or from an explicit `detail` field. It is **not** measured
+  device traffic; `device_measured_bytes` stays null. Duplicate detection is a
+  same-PC same-normalized-detail heuristic, not proof that data was unnecessary.
 
 ## Reproduce
 
@@ -1707,6 +2950,7 @@ All `*_id` columns are small integers.  Join to `cores`, `pipes`, `names`,
 ./perfp info <bin>            # show the container record table
 ./perfp <input> -o out --force --no-events-csv --raw-plain
 ./perfp <input> -o out --events-csv-plain   # events.csv instead of .gz
+./perfp compare out_a out_b -o compare_out --device-us-a 12.3 --device-us-b 11.9
 ```
 """
 
@@ -1737,6 +2981,7 @@ def build(args):
         "input": bin_path,
         "bin_size": bin_size,
         "bucket_us": args.bucket_us,
+        "gap_us": args.gap_us,
         "top_n": args.top,
         "case": case_json,
     }
@@ -1791,6 +3036,7 @@ def build(args):
             ingest_files(f, files_recs[0], ctx, db)
 
     finalize_db(db, ctx, args.bucket_us)
+    analyze_workload(db, ctx, args.gap_us)
 
     export_csvs(db, out_dir, ctx, want_events=not args.no_events_csv,
                 top_n=args.top, events_plain=args.events_csv_plain)
@@ -1879,6 +3125,283 @@ def build_all(args):
     return int(any(e["status"] == "failed" for e in index["bundles"]))
 
 
+
+# --------------------------------------------------------------------------
+# A/B comparison
+# --------------------------------------------------------------------------
+
+def _load_bundle(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    sp = os.path.join(path, "summary.json")
+    if not os.path.isfile(sp):
+        raise PerfpError(
+            f"{path} is not a perfp bundle (missing summary.json); run "
+            "`perfp <input> -o <bundle>` first")
+    with open(sp, encoding="utf-8") as f:
+        summary = json.load(f)
+    db = None
+    dp = os.path.join(path, "profile.sqlite")
+    if os.path.isfile(dp):
+        db = sqlite3.connect(dp)
+    return summary, db, path
+
+
+def _bundle_rows(db, sql):
+    if db is None:
+        return []
+    try:
+        return db.execute(sql).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def _delta(a, b):
+    if a is None or b is None:
+        return None, None
+    d = b - a
+    pct = (100.0 * d / a) if a else None
+    return d, pct
+
+
+def _metric(a, b):
+    d, pct = _delta(a, b)
+    return {"a": a, "b": b, "delta": d, "delta_pct": pct}
+
+
+def _fmt_delta(v, digits=2, suffix=""):
+    if v is None:
+        return "-"
+    return f"{v:+.{digits}f}{suffix}"
+
+
+def compare(args):
+    sa, dba, pa = _load_bundle(args.a)
+    sb, dbb, pb = _load_bundle(args.b)
+    label_a = args.label_a or os.path.basename(pa.rstrip("/")) or "A"
+    label_b = args.label_b or os.path.basename(pb.rstrip("/")) or "B"
+
+    def m(summary, path, default=None):
+        cur = summary
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
+
+    def metric(name, path, default=0):
+        return _metric(m(sa, path, default), m(sb, path, default))
+
+    metrics = {
+        "event_coverage_us": metric("event_coverage_us",
+                                    ("trace", "event_coverage_us")),
+        "dma_bytes_inferred": metric("dma_bytes_inferred",
+                                     ("dma", "bytes_inferred")),
+        "dma_events": metric("dma_events", ("dma", "events")),
+        "dma_overlap_us": metric("dma_overlap_us", ("dma", "overlap_us")),
+        "dma_duplicate_excess_bytes": metric(
+            "dma_duplicate_excess_bytes", ("dma", "duplicate_excess_bytes")),
+        "wait_us": metric("wait_us", ("waits", "wait_us")),
+        "wait_delay_us": metric("wait_delay_us",
+                                ("waits", "attributed_delay_us")),
+        "wait_on_dma_us": metric("wait_on_dma_us", ("waits", "dma_delay_us")),
+        "dma_gap_us": metric("dma_gap_us", ("pipe_gaps", "dma_gap_us")),
+        "dma_gap_attributed_us": metric(
+            "dma_gap_attributed_us", ("pipe_gaps", "dma_attributed_us")),
+        "dma_gap_unattributed_us": metric(
+            "dma_gap_unattributed_us", ("pipe_gaps", "dma_unattributed_us")),
+    }
+
+    dev_a = args.device_us_a
+    dev_b = args.device_us_b
+    dev_source = "cli" if dev_a is not None or dev_b is not None else "bundle"
+    if dev_a is None:
+        dev_a = m(sa, ("trace", "device_task_duration_us"))
+    if dev_b is None:
+        dev_b = m(sb, ("trace", "device_task_duration_us"))
+    metrics["device_task_duration_us"] = _metric(dev_a, dev_b)
+
+    # Stage alignment by exact kernel source line.  Line numbers may shift
+    # between revisions; the JSON keeps the raw keys so callers can re-align.
+    def stage_map(db):
+        dma = defaultdict(lambda: {"dma_events": 0, "dma_bytes": 0.0,
+                                   "dma_overlap_us": 0.0,
+                                   "duplicate_events": 0})
+        for f, line, events, byt, overlap, dup in _bundle_rows(
+                db, "SELECT file,line,SUM(events),SUM(bytes_inferred),"
+                    "SUM(overlap_us),SUM(duplicate_events) "
+                    "FROM v_dma_kernel_source GROUP BY file,line"):
+            key = (f or "(unknown)", line)
+            dma[key]["dma_events"] += events or 0
+            dma[key]["dma_bytes"] += byt or 0.0
+            dma[key]["dma_overlap_us"] += overlap or 0.0
+            dma[key]["duplicate_events"] += dup or 0
+        waits = defaultdict(lambda: {"waits": 0, "wait_us": 0.0,
+                                     "delay_us": 0.0})
+        for f, line, count, wait, delay in _bundle_rows(
+                db, "SELECT consumer_outer_file,consumer_outer_line,"
+                    "COUNT(*),SUM(wait_dur),SUM(COALESCE(delay_us,0)) "
+                    "FROM v_wait_attribution "
+                    "GROUP BY consumer_outer_file,consumer_outer_line"):
+            key = (f or "(unknown)", line)
+            waits[key]["waits"] += count or 0
+            waits[key]["wait_us"] += wait or 0.0
+            waits[key]["delay_us"] += delay or 0.0
+        out = {}
+        for key in set(dma) | set(waits):
+            v = {"dma_events": 0, "dma_bytes": 0.0, "dma_overlap_us": 0.0,
+                 "duplicate_events": 0, "waits": 0, "wait_us": 0.0,
+                 "delay_us": 0.0}
+            v.update(dma.get(key, {}))
+            v.update(waits.get(key, {}))
+            out[key] = v
+        return out
+
+    sa_map = stage_map(dba)
+    sb_map = stage_map(dbb)
+    stages = []
+    for key in sorted(set(sa_map) | set(sb_map)):
+        a = sa_map.get(key, {})
+        b = sb_map.get(key, {})
+        d_bytes, p_bytes = _delta(a.get("dma_bytes", 0.0),
+                                  b.get("dma_bytes", 0.0))
+        d_delay, p_delay = _delta(a.get("delay_us", 0.0),
+                                  b.get("delay_us", 0.0))
+        stages.append({
+            "file": key[0], "line": key[1],
+            "a": a, "b": b,
+            "delta_dma_bytes": d_bytes, "delta_dma_bytes_pct": p_bytes,
+            "delta_delay_us": d_delay, "delta_delay_pct": p_delay,
+        })
+    stages.sort(key=lambda r: (abs(r["delta_dma_bytes"] or 0.0)
+                               + abs(r["delta_delay_us"] or 0.0)), reverse=True)
+    stages = stages[:args.top]
+
+    def pipe_rows(db, sql):
+        return _bundle_rows(db, sql)
+
+    dma_pipe_a = {r[0] + "/" + r[1]: r for r in pipe_rows(
+        dba, "SELECT pipe,direction,SUM(events),SUM(bytes_inferred),"
+             "SUM(overlap_us) FROM v_dma_source GROUP BY pipe,direction")}
+    dma_pipe_b = {r[0] + "/" + r[1]: r for r in pipe_rows(
+        dbb, "SELECT pipe,direction,SUM(events),SUM(bytes_inferred),"
+             "SUM(overlap_us) FROM v_dma_source GROUP BY pipe,direction")}
+    dma_pipes = []
+    for key in sorted(set(dma_pipe_a) | set(dma_pipe_b)):
+        a = dma_pipe_a.get(key, ("", "", 0, 0.0, 0.0))
+        b = dma_pipe_b.get(key, ("", "", 0, 0.0, 0.0))
+        d_bytes, _ = _delta(a[3], b[3])
+        dma_pipes.append({"pipe": a[0] or b[0], "direction": a[1] or b[1],
+                          "a_events": a[2], "b_events": b[2],
+                          "a_bytes": a[3], "b_bytes": b[3],
+                          "delta_bytes": d_bytes,
+                          "a_overlap_us": a[4], "b_overlap_us": b[4]})
+
+    wait_pipe_a = {r[0]: r for r in pipe_rows(
+        dba, "SELECT COALESCE(producer_pipe,''),COUNT(*),SUM(wait_dur),"
+             "SUM(COALESCE(delay_us,0)) FROM v_wait_attribution "
+             "GROUP BY producer_pipe")}
+    wait_pipe_b = {r[0]: r for r in pipe_rows(
+        dbb, "SELECT COALESCE(producer_pipe,''),COUNT(*),SUM(wait_dur),"
+             "SUM(COALESCE(delay_us,0)) FROM v_wait_attribution "
+             "GROUP BY producer_pipe")}
+    wait_pipes = []
+    for key in sorted(set(wait_pipe_a) | set(wait_pipe_b)):
+        a = wait_pipe_a.get(key, ("", 0, 0.0, 0.0))
+        b = wait_pipe_b.get(key, ("", 0, 0.0, 0.0))
+        d, _ = _delta(a[3], b[3])
+        wait_pipes.append({"producer_pipe": a[0] or b[0],
+                           "a_waits": a[1], "b_waits": b[1],
+                           "a_delay_us": a[3], "b_delay_us": b[3],
+                           "delta_delay_us": d})
+
+    result = {
+        "perfp_version": VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "a": {"label": label_a, "bundle": pa, "input": sa.get("input")},
+        "b": {"label": label_b, "bundle": pb, "input": sb.get("input")},
+        "device_task_timing": {"source": dev_source,
+                               "a_us": dev_a, "b_us": dev_b,
+                               "delta_us": _delta(dev_a, dev_b)[0],
+                               "delta_pct": _delta(dev_a, dev_b)[1]},
+        "metrics": metrics,
+        "dma_by_pipe": dma_pipes,
+        "waits_by_producer_pipe": wait_pipes,
+        "stage_alignment": stages,
+        "notes": [
+            "Stage alignment is by exact kernel source file:line. Line shifts between revisions are not auto-matched.",
+            "DMA bytes are instruction-derived estimates; device_measured_bytes is not available from simulator input.",
+            "delay_us and pipe gaps are simulator-timeline values; device timing must be supplied separately.",
+        ],
+    }
+
+    out_dir = prepare_out(args.out, args.force)
+    with open(os.path.join(out_dir, "compare.json"), "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    L = [f"# perfp A/B comparison — {label_a} vs {label_b}", ""]
+    L.append(f"- A: `{pa}`")
+    L.append(f"- B: `{pb}`")
+    if dev_a is not None or dev_b is not None:
+        L.append(f"- device task duration source: **{dev_source}**")
+    else:
+        L.append("- device task duration: **unavailable** (pass `--device-us-a/b`)")
+    L += ["", "## Headline metrics", "",
+          f"| metric | {label_a} | {label_b} | delta | delta % |",
+          "|---|---:|---:|---:|---:|"]
+    labels = {
+        "event_coverage_us": "event coverage (us, not device time)",
+        "device_task_duration_us": "device task duration (us)",
+        "dma_bytes_inferred": "DMA bytes (estimated)",
+        "dma_events": "DMA events",
+        "dma_overlap_us": "DMA/compute overlap (us, per-event sum)",
+        "dma_duplicate_excess_bytes": "duplicate-candidate excess bytes",
+        "wait_us": "WAIT span total (us)",
+        "wait_delay_us": "attributable wait delay (us)",
+        "wait_on_dma_us": "wait delay on DMA producer (us)",
+        "dma_gap_us": "MTE2/MTE3 idle gaps (us)",
+        "dma_gap_attributed_us": "DMA gaps attributed to waits (us)",
+        "dma_gap_unattributed_us": "DMA gaps unattributed/unknown (us)",
+    }
+    for key, lab in labels.items():
+        r = metrics[key]
+        pct = "-" if r["delta_pct"] is None else f"{r['delta_pct']:+.1f}%"
+        L.append(f"| {lab} | {fmt_num(r['a'])} | {fmt_num(r['b'])} | "
+                 f"{_fmt_delta(r['delta'])} | {pct} |")
+    L += ["", "## DMA by pipe", "",
+          f"| pipe | dir | {label_a} events | {label_b} events | {label_a} bytes | {label_b} bytes | delta bytes |",
+          "|---|---|---:|---:|---:|---:|---:|"]
+    for r in dma_pipes:
+        L.append(f"| {r['pipe']} | {r['direction']} | {r['a_events']:,} | "
+                 f"{r['b_events']:,} | {fmt_num(r['a_bytes'])} | "
+                 f"{fmt_num(r['b_bytes'])} | {_fmt_delta(r['delta_bytes'])} |")
+    L += ["", "## Wait delay by producer pipe", "",
+          "| producer pipe | A waits | B waits | A delay_us | B delay_us | delta delay_us |",
+          "|---|---:|---:|---:|---:|---:|"]
+    for r in wait_pipes:
+        L.append(f"| {r['producer_pipe'] or '(unknown)'} | {r['a_waits']:,} | "
+                 f"{r['b_waits']:,} | {fmt_num(r['a_delay_us'])} | "
+                 f"{fmt_num(r['b_delay_us'])} | {_fmt_delta(r['delta_delay_us'])} |")
+    L += ["", "## Stage alignment (exact kernel source line)", "",
+          "| file | line | A DMA bytes | B DMA bytes | delta bytes | A delay_us | B delay_us | delta delay_us |",
+          "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for r in stages:
+        L.append(f"| {r['file']} | {r['line'] if r['line'] is not None else '-'} | "
+                 f"{fmt_num(r['a'].get('dma_bytes'))} | "
+                 f"{fmt_num(r['b'].get('dma_bytes'))} | "
+                 f"{_fmt_delta(r['delta_dma_bytes'])} | "
+                 f"{fmt_num(r['a'].get('delay_us'))} | "
+                 f"{fmt_num(r['b'].get('delay_us'))} | "
+                 f"{_fmt_delta(r['delta_delay_us'])} |")
+    L += ["", "## Notes", ""] + [f"- {n}" for n in result["notes"]] + [""]
+    with open(os.path.join(out_dir, "compare.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+    for db in (dba, dbb):
+        if db is not None:
+            db.close()
+    eprint(f"[perfp] compare -> {out_dir}/compare.md")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # info
 # --------------------------------------------------------------------------
@@ -1929,7 +3452,8 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # Allow `perfp <input> ...` as a shorthand for `perfp build <input> ...`.
-    if argv and argv[0] not in ("build", "info", "-h", "--help", "--version"):
+    if argv and argv[0] not in ("build", "info", "compare", "-h", "--help",
+                                "--version"):
         argv = ["build"] + argv
 
     ap = argparse.ArgumentParser(
@@ -1940,7 +3464,8 @@ def main(argv=None):
                "  perfp /data/smoke_p03 -o perfp_out\n"
                "  perfp build /data/OPPROF_*/simulator/visualize_data.bin "
                "-o out --force\n"
-               "  perfp info /data/smoke_p03\n",
+               "  perfp info /data/smoke_p03\n"
+               "  perfp compare out_a out_b -o compare_out\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"perfp {VERSION}")
 
@@ -1952,6 +3477,9 @@ def main(argv=None):
                    help="output directory (default: perfp_out)")
     b.add_argument("--bucket-us", type=float, default=0.5,
                    help="timeline histogram bucket in us (default: 0.5)")
+    b.add_argument("--gap-us", type=float, default=DEFAULT_GAP_US,
+                   help="minimum pipe idle gap to report in us "
+                        f"(default: {DEFAULT_GAP_US})")
     b.add_argument("--top", type=int, default=30,
                    help="number of rows in top-N tables (default: 30)")
     b.add_argument("--force", action="store_true",
@@ -1969,6 +3497,23 @@ def main(argv=None):
     b.add_argument("--quiet", action="store_true")
     b.add_argument("--all", action="store_true", help="process every visualize_data.bin in a directory and write a batch index")
 
+    c = sub.add_parser("compare",
+                       help="align two perfp bundles and compare DMA/wait metrics")
+    c.add_argument("a", help="baseline perfp bundle directory")
+    c.add_argument("b", help="candidate perfp bundle directory")
+    c.add_argument("-o", "--out", default="perfp_compare",
+                   help="output directory (default: perfp_compare)")
+    c.add_argument("--label-a", help="display label for A")
+    c.add_argument("--label-b", help="display label for B")
+    c.add_argument("--device-us-a", type=float,
+                   help="independent device task duration for A, in us")
+    c.add_argument("--device-us-b", type=float,
+                   help="independent device task duration for B, in us")
+    c.add_argument("--top", type=int, default=30,
+                   help="number of stage rows to report (default: 30)")
+    c.add_argument("--force", action="store_true",
+                   help="replace a non-empty output directory")
+
     i = sub.add_parser("info", help="show the container record table")
     i.add_argument("input")
     i.add_argument("--json", action="store_true")
@@ -1978,9 +3523,15 @@ def main(argv=None):
     if args.cmd == "build":
         if not math.isfinite(args.bucket_us) or args.bucket_us <= 0:
             ap.error("--bucket-us must be finite and greater than zero")
+        if not math.isfinite(args.gap_us) or args.gap_us < 0:
+            ap.error("--gap-us must be finite and non-negative")
         if args.top <= 0:
             ap.error("--top must be greater than zero")
         return build_all(args) if args.all else build(args)
+    if args.cmd == "compare":
+        if args.top <= 0:
+            ap.error("--top must be greater than zero")
+        return compare(args)
     if args.cmd == "info":
         return info(args)
     ap.print_help()

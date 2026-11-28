@@ -36,8 +36,47 @@ Chrome Trace JSON + 若干二进制记录）转换成 **AI agent 可以直接分
 | `pipes[].share` | 累计指令延迟占比，不是利用率或关键路径占比 |
 | `quality.status` | `ok` / `caution`：已实现的结构/计数检查结果，不是物理模型准确度保证 |
 
-计数不一致的原因可能涉及生产端统计口径、映射或解析；工具不会据此断言丢失事件。
+计数不一致的可能涉及生产端统计口径、映射或解析；工具不会据此断言丢失事件。
 `cycles` 的真实时钟含义尚未验证，不能换算微秒。热点排名不等于已证明的性能瓶颈。
+
+## 0.3：DMA / 等待 / A-B 分析
+
+0.3 增加三类面向「DMA 是否该更早搬」的分析。它们都基于**模拟器时间线**，
+不能替代真机带宽或真机任务耗时。
+
+### 1. 按核、按流水线的空档与等待归因
+
+- `pipe_segments`：每个 core+pipe 的合并活动区间（X 事件）。
+- `pipe_gaps`：活动区间之间的内部空档；`attributed_us` 是与该 pipe 的
+  消费者 WAIT 重叠的部分，`unattributed_us` 明确标为未知。
+- `wait_attribution`：按 `group_id` 配对 `WAIT_FLAG` / `SET_FLAG`，并把
+  SET 标记替换为同 core+pipe 上**实际执行的那条 X 指令**（通常是 MTE2/MTE3
+  搬运），因此能回答「哪一行计算因等哪一笔 DMA 晚开始了多少时间」。
+
+`delay_us` 是 WAIT span 内被阻塞的部分；无法配对的等待保持 `NULL` 和
+`unknown_no_producer` 状态，不会当作 0。
+
+### 2. 按源码 / 缓冲区统计搬运字节
+
+- `dma_events`：每条 MTE2/MTE3 X 事件的推算块大小、方向、规范化 detail、
+  重复序号、地址步长，以及与同核非 DMA 活动的重叠时间。
+- 字节优先取 `detail` 的显式字段；否则用静态指令的
+  `Process Bytes / Instructions Executed` 推算。无法推算时保持 `NULL`，
+  `device_measured_bytes` 永远是 `null`。
+- `classification` 只给出 `duplicate_candidate` / `padding_candidate` /
+  `unclassified`。重复读取是「同 PC + 同规范化 detail」的启发式，不是
+  数据无用或可删除的证明。
+
+### 3. 按阶段对齐的 A/B 对比
+
+```bash
+perfp compare bundle_a bundle_b -o compare_out \
+    --device-us-a 12.3 --device-us-b 11.9
+```
+
+输出 `compare.md` / `compare.json`，同屏给出搬运字节、与计算重叠时间、
+消费者等待时间、DMA 空档及可选的**独立真机任务耗时**。阶段按
+`kernel.asc` 的精确 `file:line` 对齐；行号变化不会自动匹配。
 
 ---
 
@@ -60,6 +99,10 @@ Chrome Trace JSON + 若干二进制记录）转换成 **AI agent 可以直接分
 # 已存在输出目录时覆盖
 ./perfp /path/to/case -o perfp_out --force
 
+# A/B：两个已构建的 bundle，可附带独立真机耗时
+./perfp compare perfp_a perfp_b -o perfp_compare \
+        --device-us-a 12.3 --device-us-b 11.9
+
 # 查询
 sqlite3 perfp_out/profile.sqlite
 ```
@@ -70,6 +113,7 @@ sqlite3 perfp_out/profile.sqlite
 |---|---|
 | `-o, --out DIR` | 输出目录，默认 `perfp_out` |
 | `--bucket-us F` | 时间直方图桶宽，默认 `0.5` us |
+| `--gap-us F` | 最小 pipe 内部空档，默认 `0.1` us |
 | `--top N` | 摘要里的 Top-N 行数，默认 30 |
 | `--force` | 覆盖非空输出目录 |
 | `--no-raw` | 不保留原始 timeline |
@@ -90,7 +134,7 @@ perfp_out/
   summary.md                # 给人 / LLM 看的摘要
   summary.json              # 同样的数字，机器可读
   schema.sql                # SQLite DDL
-  queries.sql               # 10 条常用查询
+  queries.sql               # 16 条常用查询
   profile.sqlite            # 可查询数据库
   csv/
     cores.csv  pipes.csv  names.csv
@@ -98,6 +142,10 @@ perfp_out/
     instructions.csv  instruction_core.csv  code_lines.csv
     files.csv  file_lines.csv
     timeline_hist.csv  spans.csv  top_events.csv
+    pipe_segments.csv  pipe_activity.csv  pipe_gaps.csv
+    wait_attribution.csv
+    dma_by_source.csv  dma_by_kernel_source.csv  dma_by_buffer.csv
+    dma_by_instruction.csv  dma_duplicates.csv  dma_events.csv
     cores_simlog.csv        # 如果找到了 *.sim.log
     events.csv.gz           # 全量事件流（字典 id）
   src/
@@ -158,6 +206,10 @@ type == 1（内嵌源码）后面再跟 4096 字节 0 填充
 | `instruction_core` | 89,452 | 指令 × 核计数器 |
 | `files` / `file_lines` | 28 / ~600 | 记录 #29 的行级统计 |
 | `timeline_hist` | small | 0.5 us 粒度的时间直方图 |
+| `pipe_segments` | per core+pipe | 合并后的 X 活动区间 |
+| `pipe_gaps` | per core+pipe | 内部空档、归因/未知时长、重叠 pipe |
+| `wait_attribution` | per WAIT span | 配对的 producer、实际 DMA 事件、delay |
+| `dma_events` | per MTE X event | 推算字节、方向、buffer、重复、重叠 |
 
 所有 `*_id` 都是小整数，join 到对应字典表即可拿到文本。
 
@@ -168,6 +220,11 @@ type == 1（内嵌源码）后面再跟 4096 字节 0 填充
 - `v_code_line_core`：同上，按核
 - `v_exec_location`：按调用栈**最内层**（实际执行的 CANN 原语）汇总 trace 耗时
 - `v_kernel_location`：按调用栈**最外层**（用户 `kernel.asc` 行）汇总 trace 耗时
+- `v_pipe_activity` / `v_pipe_gap`：core+pipe 活动、空档与等待归因
+- `v_wait_attribution`：WAIT/SET 配对、delay、producer/consumer 源码行
+- `v_dma_source` / `v_dma_kernel_source`：按内层 / kernel 源码行汇总 DMA
+- `v_dma_buffer` / `v_dma_instruction`：按 buffer 形状、指令汇总 DMA
+- `v_dma_duplicate`：重复读取候选及估算冗余字节
 
 ---
 
@@ -182,6 +239,9 @@ type == 1（内嵌源码）后面再跟 4096 字节 0 填充
   不应称为真机时长。负跨度、缺失时间和未配对端点会计入质量诊断。
 - 旧样本中：`X` 事件 605,420 + `B/E` span 10,108 = 615,528 = `Instructions
   Executed` 总和。这不是所有生产端版本都成立的恒等式；不一致时输出量化诊断。
+- `pipe_gaps.dur` 只统计同一 core+pipe **内部**活动之间的空档，不含首次搬运前/最后一次搬运后的尾部时间。`attributed_us` 是与该 pipe 的消费者 WAIT 的交集；其余是未知，不能称为「空闲可优化」。
+- `wait_attribution.delay_us` 是 WAIT 内被阻塞的模拟器时间。无法配对时保持 `NULL`，不填 0。
+- `dma_events.block_bytes` 是静态 `Process Bytes / calls` 或 detail 字段的推算值，不是真机流量；`device_measured_bytes` 永远为 `null`。`duplicate_candidate` 只是同 PC + 同规范化 detail 的启发式。
 
 ---
 
@@ -218,4 +278,7 @@ python3 -m unittest -v test_agent_features.py
 
 # 可选：原始大样本的固定计数回归；没有样本会明确跳过
 PERFP_SAMPLE=/path/to/original/smoke_p03 python3 test_perfp.py
+
+# 0.3 的 pipe gap / wait / DMA / compare 回归
+python3 -m unittest -v test_analysis_features.py
 ```
